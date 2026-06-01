@@ -1,0 +1,124 @@
+================================================================
+  SSH Panel Manager - Ubuntu 22.04 Requirements
+================================================================
+
+SYSTEM REQUIREMENTS:
+  - Ubuntu 22.04 LTS (Jammy Jellyfish)
+  - Root / sudo access
+  - Minimum 512MB RAM
+  - Minimum 1GB disk space
+  - Open port for panel (default: 8080)
+  - Open port for SSH (default: 22)
+
+================================================================
+  REQUIRED PACKAGES (apt)
+================================================================
+
+1.  php8.1              - PHP runtime (main language)
+2.  php8.1-cli          - PHP command-line interface
+3.  php8.1-sqlite3      - SQLite3 extension for PHP
+4.  php8.1-mbstring     - Multibyte string support
+5.  php8.1-xml          - XML parsing
+6.  php8.1-curl         - cURL for Telegram API
+7.  php8.1-gd           - Image/QR code generation
+8.  php8.1-zip          - ZIP archive support for backups
+9.  php8.1-json         - JSON support
+10. php8.1-bcmath       - Math functions for traffic calc
+11. sqlite3             - SQLite3 database engine (CLI)
+12. openssh-server      - SSH server daemon
+13. net-tools           - Network tools (netstat, etc.)
+14. curl                - HTTP client
+15. wget                - File downloader
+16. unzip               - Archive extraction
+17. cron                - Task scheduler (traffic monitor)
+18. jq                  - JSON processor (for backups)
+19. vnstat              - Network traffic monitoring
+20. iptables            - Firewall & traffic accounting
+21. sudo                - Privilege escalation
+22. bc                  - Calculator for traffic math
+
+================================================================
+  MANUAL INSTALL COMMANDS
+================================================================
+
+# Update system
+sudo apt-get update -y && sudo apt-get upgrade -y
+
+# Install all packages at once
+sudo apt-get install -y php8.1 php8.1-cli php8.1-sqlite3 \
+    php8.1-mbstring php8.1-xml php8.1-curl php8.1-gd \
+    php8.1-zip php8.1-json php8.1-bcmath sqlite3 \
+    openssh-server net-tools curl wget unzip cron jq \
+    vnstat iptables sudo bc
+
+# If php8.1 not found, add PHP PPA first:
+sudo add-apt-repository ppa:ondrej/php -y
+sudo apt-get update -y
+
+================================================================
+  FIREWALL SETUP (ufw)
+================================================================
+
+sudo ufw allow 22/tcp        # SSH port
+sudo ufw allow 8080/tcp      # Panel port (change as needed)
+sudo ufw enable
+
+================================================================
+  QUICK INSTALL (AUTOMATED)
+================================================================
+
+sudo bash install.sh
+
+================================================================
+  FILE STRUCTURE
+================================================================
+
+/opt/sshpanel/
+├── index.php            # Main entry point & router
+├── init_db.php          # Database initialization
+├── config.php           # Configuration
+├── functions.php        # Core functions (user mgmt, etc.)
+├── api.php              # API endpoints
+├── install.sh           # Automated installer
+├── database/
+│   └── panel.db         # SQLite database
+├── backups/
+│   └── *.sql            # SQL backup files
+├── logs/
+│   ├── panel.log        # Access log
+│   └── panel_error.log  # Error log
+└── assets/
+    └── (css/js bundled inline)
+
+================================================================
+  SERVICE MANAGEMENT
+================================================================
+
+sudo systemctl start sshpanel      # Start panel
+sudo systemctl stop sshpanel       # Stop panel
+sudo systemctl restart sshpanel    # Restart panel
+sudo systemctl status sshpanel     # Check status
+sudo systemctl enable sshpanel     # Auto-start on boot
+
+journalctl -u sshpanel -f          # Live logs
+
+================================================================
+  DEFAULT CREDENTIALS
+================================================================
+
+Admin Username: admin
+Admin Password: admin
+
+** CHANGE IMMEDIATELY AFTER INSTALL **
+
+================================================================
+  CHANGING PANEL PORT
+================================================================
+
+1. Edit /etc/systemd/system/sshpanel.service
+2. Change the port in ExecStart line
+3. Run: sudo systemctl daemon-reload
+4. Run: sudo systemctl restart sshpanel
+5. Update firewall: sudo ufw allow NEW_PORT/tcp
+
+================================================================
