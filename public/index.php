@@ -1,1083 +1,664 @@
 <?php
-/**
- * SSH Panel Manager - Main Entry Point (FIXED)
- */
-
 session_start();
+error_reporting(E_ALL);
+ini_set('display_errors', 0);
 
-// Initialize database if needed
-if (!file_exists(__DIR__ . '/database/panel.db')) {
-    require_once __DIR__ . '/init_db.php';
+define('DB_PATH', __DIR__ . '/database/panel.db');
+define('BACKUP_DIR', __DIR__ . '/backups');
+define('VERSION', '1.0.0');
+
+// ============================================================
+// DATABASE
+// ============================================================
+function initDB() {
+    $dir = dirname(DB_PATH);
+    if (!is_dir($dir)) mkdir($dir, 0777, true);
+    if (!is_dir(BACKUP_DIR)) mkdir(BACKUP_DIR, 0777, true);
+    $db = new SQLite3(DB_PATH);
+    $db->exec('PRAGMA journal_mode=WAL;');
+    $db->exec("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    $db->exec("CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password TEXT NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP, expires_at TEXT NOT NULL,
+        max_conn INTEGER DEFAULT 1, cur_conn INTEGER DEFAULT 0,
+        data_limit REAL DEFAULT 0, data_used REAL DEFAULT 0, bw_limit INTEGER DEFAULT 0,
+        is_online INTEGER DEFAULT 0, is_enabled INTEGER DEFAULT 1, ips TEXT DEFAULT ''
+    )");
+    $db->exec("CREATE TABLE IF NOT EXISTS telegram_chats (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT UNIQUE NOT NULL)");
+    foreach (['ssh_port'=>'22','admin_user'=>'admin','admin_pass'=>'admin','server_ip'=>'','tg_token'=>''] as $k=>$v) {
+        $s = $db->prepare("INSERT OR IGNORE INTO settings (key,value) VALUES (:k,:v)");
+        $s->bindValue(':k',$k); $s->bindValue(':v',$v); $s->execute();
+    }
+    return $db;
+}
+function getDB() { static $db=null; if(!$db) $db=initDB(); return $db; }
+function getSetting($k,$d='') { $s=getDB()->prepare("SELECT value FROM settings WHERE key=:k"); $s->bindValue(':k',$k); $r=$s->execute()->fetchArray(SQLITE3_ASSOC); return $r?$r['value']:$d; }
+function setSetting($k,$v) { $s=getDB()->prepare("INSERT OR REPLACE INTO settings (key,value) VALUES (:k,:v)"); $s->bindValue(':k',$k); $s->bindValue(':v',$v); $s->execute(); }
+function getServerIP() { $ip=getSetting('server_ip'); if($ip) return $ip; $ip=trim(shell_exec("hostname -I 2>/dev/null|awk '{print $1}'")?:''); return $ip?:($_SERVER['SERVER_ADDR']??'0.0.0.0'); }
+
+// ============================================================
+// USER DB
+// ============================================================
+function getUsers() { $r=getDB()->query("SELECT * FROM users ORDER BY created_at DESC"); $u=[]; while($row=$r->fetchArray(SQLITE3_ASSOC)) $u[]=$row; return $u; }
+function getUserById($id) { $s=getDB()->prepare("SELECT * FROM users WHERE id=:id"); $s->bindValue(':id',$id,SQLITE3_INTEGER); return $s->execute()->fetchArray(SQLITE3_ASSOC); }
+function getUserByUsername($u) { $s=getDB()->prepare("SELECT * FROM users WHERE username=:u"); $s->bindValue(':u',$u); return $s->execute()->fetchArray(SQLITE3_ASSOC); }
+function addUserDB($d) {
+    $s=getDB()->prepare("INSERT INTO users (username,password,expires_at,max_conn,data_limit,bw_limit,is_enabled) VALUES (:u,:p,:e,:m,:d,:b,1)");
+    $s->bindValue(':u',$d['username']); $s->bindValue(':p',$d['password']); $s->bindValue(':e',$d['expires_at']);
+    $s->bindValue(':m',$d['max_conn'],SQLITE3_INTEGER); $s->bindValue(':d',$d['data_limit'],SQLITE3_FLOAT); $s->bindValue(':b',$d['bw_limit'],SQLITE3_INTEGER);
+    $s->execute(); return getDB()->lastInsertRowID();
+}
+function updateUserDB($id,$data) {
+    $sets=[]; foreach($data as $k=>$v) $sets[]="$k=:$k";
+    $sql="UPDATE users SET ".implode(',',$sets)." WHERE id=:id";
+    $s=getDB()->prepare($sql); $s->bindValue(':id',$id,SQLITE3_INTEGER);
+    foreach($data as $k=>$v) { if(is_int($v)) $s->bindValue(":$k",$v,SQLITE3_INTEGER); elseif(is_float($v)) $s->bindValue(":$k",$v,SQLITE3_FLOAT); else $s->bindValue(":$k",$v); }
+    $s->execute();
+}
+function deleteUserDB($id) { $s=getDB()->prepare("DELETE FROM users WHERE id=:id"); $s->bindValue(':id',$id,SQLITE3_INTEGER); $s->execute(); }
+
+// ============================================================
+// SYSTEM USER (real Linux commands)
+// ============================================================
+function createSystemUser($u,$p) {
+    $su=escapeshellarg($u); $sp=escapeshellarg($p);
+    exec("id $su 2>/dev/null",$o,$r); if($r===0) return false;
+    exec("groupadd -f sshusers 2>/dev/null");
+    exec("useradd -m -s /bin/bash -G sshusers $su 2>&1",$o,$r);
+    if($r!==0) { exec("useradd -m -s /bin/bash $su 2>&1",$o2,$r2); if($r2!==0) return false; }
+    exec("echo $su:$sp | chpasswd 2>&1",$o,$r); if($r!==0){ exec("userdel -r $su 2>/dev/null"); return false; }
+    return true;
+}
+function deleteSystemUser($u) { $s=escapeshellarg($u); exec("pkill -KILL -u $s 2>/dev/null"); sleep(1); exec("userdel -r $s 2>/dev/null"); }
+function lockSystemUser($u) { $s=escapeshellarg($u); exec("passwd -l $s 2>/dev/null"); exec("pkill -KILL -u $s 2>/dev/null"); }
+function unlockSystemUser($u) { $s=escapeshellarg($u); exec("passwd -u $s 2>/dev/null"); }
+function kickUser($u) { $s=escapeshellarg($u); exec("pkill -KILL -u $s 2>/dev/null"); }
+function changeSSHPort($port) {
+    $port=(int)$port; if($port<1||$port>65535) return false;
+    $c=@file_get_contents('/etc/ssh/sshd_config'); if(!$c) return false;
+    $c=preg_match('/^Port\s+\d+/m',$c)?preg_replace('/^Port\s+\d+/m',"Port $port",$c):"Port $port\n".$c;
+    file_put_contents('/etc/ssh/sshd_config',$c);
+    exec("systemctl restart sshd 2>/dev/null||systemctl restart ssh 2>/dev/null");
+    setSetting('ssh_port',$port); return true;
 }
 
-require_once __DIR__ . '/functions.php';
-
-// Route handling
-$page = $_GET['page'] ?? 'login';
-$isAdminLoggedIn = isset($_SESSION['admin_logged_in']) && $_SESSION['admin_logged_in'] === true;
-$isUserLoggedIn = isset($_SESSION['user_logged_in']) && $_SESSION['user_logged_in'] === true;
-
-// Handle logout
-if ($page === 'logout') {
-    session_destroy();
-    header('Location: ?page=login');
-    exit;
+// ============================================================
+// FULL OPERATIONS
+// ============================================================
+function createUser($d) {
+    if(getUserByUsername($d['username'])) return ['ok'=>false,'err'=>'Username exists'];
+    $sys = createSystemUser($d['username'],$d['password']);
+    $id = addUserDB($d);
+    return ['ok'=>true,'id'=>$id,'sys'=>$sys];
+}
+function deleteUser($id) {
+    $u=getUserById($id); if(!$u) return;
+    deleteSystemUser($u['username']);
+    deleteUserDB($id);
+}
+function toggleUser($id) {
+    $u=getUserById($id); if(!$u) return;
+    $new=$u['is_enabled']?0:1;
+    if($new) unlockSystemUser($u['username']); else lockSystemUser($u['username']);
+    updateUserDB($id,['is_enabled'=>$new]);
 }
 
-// Handle user logout
-if ($page === 'user_logout') {
-    unset($_SESSION['user_logged_in'], $_SESSION['user_id'], $_SESSION['user_username']);
-    header('Location: ?page=user_login');
-    exit;
-}
-
-// Handle admin login POST
-if ($page === 'login' && $_SERVER['REQUEST_METHOD'] === 'POST') {
-    $username = $_POST['username'] ?? '';
-    $password = $_POST['password'] ?? '';
-    $adminUser = getSetting('admin_username', 'admin');
-    $adminPassHash = getSetting('admin_password', '');
-
-    $valid = false;
-    if ($username === $adminUser) {
-        if (!empty($adminPassHash) && password_verify($password, $adminPassHash)) {
-            $valid = true;
+// ============================================================
+// SYNC ONLINE
+// ============================================================
+function syncOnline() {
+    $online=[]; exec("who 2>/dev/null",$lines);
+    foreach($lines as $l) {
+        if(preg_match('/^(\S+)\s+\S+\s+\S+\s+\S+\s*\(([^)]*)\)?/',$l,$m)) {
+            $u=$m[1]; $ip=trim($m[2]??'');
+            if(!isset($online[$u])) $online[$u]=['c'=>0,'ips'=>[]];
+            $online[$u]['c']++;
+            if($ip&&$ip!==':0'&&!in_array($ip,$online[$u]['ips'])) $online[$u]['ips'][]=$ip;
         }
-        // Default credentials on first run
-        if ($username === 'admin' && $password === 'admin' && (empty($adminPassHash) || $adminPassHash === 'admin')) {
-            $valid = true;
-            setSetting('admin_password', password_hash('admin', PASSWORD_DEFAULT));
-        }
     }
-
-    if ($valid) {
-        $_SESSION['admin_logged_in'] = true;
-        $_SESSION['admin_username'] = $username;
-        header('Location: ?page=dashboard');
-        exit;
-    } else {
-        $loginError = 'Invalid username or password';
-    }
-}
-
-// Handle user login POST
-if ($page === 'user_login' && $_SERVER['REQUEST_METHOD'] === 'POST') {
-    $username = $_POST['username'] ?? '';
-    $password = $_POST['password'] ?? '';
-    $user = getUserByUsername($username);
-    if ($user && $user['password'] === $password) {
-        $_SESSION['user_logged_in'] = true;
-        $_SESSION['user_id'] = $user['id'];
-        $_SESSION['user_username'] = $user['username'];
-        header('Location: ?page=my_account');
-        exit;
-    } else {
-        $userLoginError = 'Invalid username or password';
-    }
-}
-
-// Redirect logic
-if ($isAdminLoggedIn && $page === 'login') {
-    header('Location: ?page=dashboard');
-    exit;
-}
-
-$adminPages = ['dashboard', 'users', 'online', 'settings'];
-if (in_array($page, $adminPages) && !$isAdminLoggedIn) {
-    header('Location: ?page=login');
-    exit;
-}
-
-if ($page === 'my_account' && !$isUserLoggedIn) {
-    header('Location: ?page=user_login');
-    exit;
-}
-
-// Handle admin actions via POST
-if ($isAdminLoggedIn && $_SERVER['REQUEST_METHOD'] === 'POST') {
-    $action = $_POST['action'] ?? '';
-
-    if ($action === 'create_user') {
-        $username = trim($_POST['username'] ?? '');
-        $password = $_POST['password'] ?? '';
-        if (empty($password)) {
-            $password = generateRandomPassword();
-        }
-        $days = (int)($_POST['days'] ?? 30);
-        $result = createUser([
-            'username' => $username,
-            'password' => $password,
-            'expires_at' => date('Y-m-d H:i:s', time() + $days * 86400),
-            'max_connections' => (int)($_POST['max_connections'] ?? 1),
-            'data_limit' => (float)($_POST['data_limit'] ?? 0),
-            'bandwidth_limit' => (int)($_POST['bandwidth_limit'] ?? 0),
-            'is_enabled' => 1,
-        ]);
-        $_SESSION['flash'] = $result['success']
-            ? "User '{$username}' created! " . ($result['system_created'] ? '(System + DB)' : '(DB only - run as root for system user)')
-            : ('Error: ' . ($result['error'] ?? 'Unknown'));
-        header('Location: ?page=users');
-        exit;
-    }
-
-    if ($action === 'delete_user') {
-        $id = (int)($_POST['id'] ?? 0);
-        $user = getUserById($id);
-        $result = removeUser($id);
-        $_SESSION['flash'] = $result['success']
-            ? "User '{$user['username']}' deleted from system and database."
-            : ('Error: ' . ($result['error'] ?? 'Unknown'));
-        header('Location: ?page=users');
-        exit;
-    }
-
-    if ($action === 'toggle_user') {
-        $id = (int)($_POST['id'] ?? 0);
-        $user = getUserById($id);
-        toggleUser($id);
-        $newState = $user['is_enabled'] ? 'paused' : 'enabled';
-        $_SESSION['flash'] = "User '{$user['username']}' {$newState}.";
-        header('Location: ?page=users');
-        exit;
-    }
-
-    if ($action === 'kick_user') {
-        $id = (int)($_POST['id'] ?? 0);
-        $user = getUserById($id);
-        if ($user) {
-            kickUser($user['username']);
-            updateDBUser($id, ['is_online' => 0, 'current_connections' => 0, 'connected_ips' => '']);
-            $_SESSION['flash'] = "User '{$user['username']}' kicked.";
-        }
-        header('Location: ?page=online');
-        exit;
-    }
-
-    if ($action === 'update_user') {
-        $id = (int)($_POST['id'] ?? 0);
-        $user = getUserById($id);
-        if ($user) {
-            $data = [];
-            if (!empty($_POST['password'])) {
-                $data['password'] = $_POST['password'];
-                changeSystemPassword($user['username'], $_POST['password']);
-            }
-            if (isset($_POST['days']) && $_POST['days'] !== '') {
-                $data['expires_at'] = date('Y-m-d H:i:s', time() + (int)$_POST['days'] * 86400);
-            }
-            if (isset($_POST['max_connections']) && $_POST['max_connections'] !== '') {
-                $data['max_connections'] = (int)$_POST['max_connections'];
-            }
-            if (isset($_POST['data_limit']) && $_POST['data_limit'] !== '') {
-                $data['data_limit'] = (float)$_POST['data_limit'];
-            }
-            if (isset($_POST['bandwidth_limit']) && $_POST['bandwidth_limit'] !== '') {
-                $data['bandwidth_limit'] = (int)$_POST['bandwidth_limit'];
-                setBandwidthLimit($user['username'], (int)$_POST['bandwidth_limit']);
-            }
-            updateDBUser($id, $data);
-            $_SESSION['flash'] = "User '{$user['username']}' updated.";
-        }
-        header('Location: ?page=users');
-        exit;
-    }
-
-    if ($action === 'reset_data') {
-        $id = (int)($_POST['id'] ?? 0);
-        $user = getUserById($id);
-        updateDBUser($id, ['data_used' => 0]);
-        $_SESSION['flash'] = "Data usage reset for '{$user['username']}'.";
-        header('Location: ?page=users');
-        exit;
-    }
-
-    if ($action === 'save_settings') {
-        if (!empty($_POST['ssh_port'])) {
-            $portResult = changeSSHPort((int)$_POST['ssh_port']);
-            if (!$portResult['success']) {
-                $_SESSION['flash'] = 'Warning: SSH port change failed - ' . $portResult['error'];
+    foreach(getUsers() as $u) {
+        $on=isset($online[$u['username']]);
+        $c=$on?$online[$u['username']]['c']:0;
+        $ips=$on?implode(',',$online[$u['username']]['ips']):'';
+        updateUserDB($u['id'],['is_online'=>$on?1:0,'cur_conn'=>$c,'ips'=>$ips]);
+        if($u['is_enabled']) {
+            if(strtotime($u['expires_at'])<time()||($u['data_limit']>0&&$u['data_used']>=$u['data_limit'])) {
+                lockSystemUser($u['username']);
+                updateUserDB($u['id'],['is_enabled'=>0]);
             }
         }
-        if (!empty($_POST['admin_username'])) {
-            setSetting('admin_username', $_POST['admin_username']);
-        }
-        if (!empty($_POST['admin_password_new'])) {
-            setSetting('admin_password', password_hash($_POST['admin_password_new'], PASSWORD_DEFAULT));
-        }
-        if (isset($_POST['telegram_bot_token'])) {
-            setSetting('telegram_bot_token', $_POST['telegram_bot_token']);
-        }
-        if (isset($_POST['telegram_backup_enabled'])) {
-            setSetting('telegram_backup_enabled', $_POST['telegram_backup_enabled']);
-        }
-        if (isset($_POST['telegram_backup_interval'])) {
-            setSetting('telegram_backup_interval', $_POST['telegram_backup_interval']);
-        }
-        if (isset($_POST['server_ip'])) {
-            setSetting('server_ip', $_POST['server_ip']);
-        }
-        if (!isset($_SESSION['flash'])) {
-            $_SESSION['flash'] = 'Settings saved!';
-        }
-        header('Location: ?page=settings');
-        exit;
-    }
-
-    if ($action === 'add_chat_id') {
-        $chatId = trim($_POST['chat_id'] ?? '');
-        if (!empty($chatId)) {
-            addTelegramChatId($chatId);
-            $_SESSION['flash'] = "Chat ID added.";
-        }
-        header('Location: ?page=settings');
-        exit;
-    }
-
-    if ($action === 'remove_chat_id') {
-        removeTelegramChatId(trim($_POST['chat_id'] ?? ''));
-        header('Location: ?page=settings');
-        exit;
-    }
-
-    if ($action === 'create_backup') {
-        $result = createBackup();
-        if ($result['success']) {
-            header('Content-Type: application/sql');
-            header('Content-Disposition: attachment; filename="' . $result['filename'] . '"');
-            readfile($result['filepath']);
-            exit;
-        }
-        $_SESSION['flash'] = 'Backup failed.';
-        header('Location: ?page=settings');
-        exit;
-    }
-
-    if ($action === 'telegram_backup') {
-        $result = sendTelegramBackup();
-        $_SESSION['flash'] = $result['success'] ? 'Backup sent to Telegram!' : ('Error: ' . ($result['error'] ?? 'Failed'));
-        header('Location: ?page=settings');
-        exit;
-    }
-
-    if ($action === 'test_telegram') {
-        $stats = getPanelStats();
-        $msg = "✅ <b>SSH Panel Test</b>\n📅 " . date('Y-m-d H:i:s') . "\n🖥 Server: " . getServerIP() . "\n👥 Users: {$stats['total_users']}\n🟢 Online: {$stats['online_users']}";
-        $result = sendTelegramMessage($msg);
-        $_SESSION['flash'] = $result['success'] ? 'Test message sent!' : ('Error: ' . ($result['error'] ?? 'Failed'));
-        header('Location: ?page=settings');
-        exit;
-    }
-
-    if ($action === 'restore_backup' && isset($_FILES['backup_file']) && $_FILES['backup_file']['error'] === 0) {
-        $content = file_get_contents($_FILES['backup_file']['tmp_name']);
-        $result = restoreBackup($content);
-        $_SESSION['flash'] = $result['success'] ? "Backup restored! ({$result['executed']} queries, {$result['errors']} errors)" : 'Restore failed.';
-        header('Location: ?page=settings');
-        exit;
     }
 }
 
-// Sync online status
-try {
-    syncOnlineStatus();
-} catch (Exception $e) {
-    // Continue even if sync fails
+// ============================================================
+// TELEGRAM
+// ============================================================
+function getTgChats() { $r=getDB()->query("SELECT chat_id FROM telegram_chats"); $c=[]; while($row=$r->fetchArray(SQLITE3_ASSOC)) $c[]=$row['chat_id']; return $c; }
+function addTgChat($c) { $s=getDB()->prepare("INSERT OR IGNORE INTO telegram_chats (chat_id) VALUES (:c)"); $s->bindValue(':c',$c); $s->execute(); }
+function removeTgChat($c) { $s=getDB()->prepare("DELETE FROM telegram_chats WHERE chat_id=:c"); $s->bindValue(':c',$c); $s->execute(); }
+function sendTgMsg($msg) {
+    $tk=getSetting('tg_token'); if(!$tk) return;
+    foreach(getTgChats() as $ch) {
+        $c=curl_init("https://api.telegram.org/bot{$tk}/sendMessage");
+        curl_setopt_array($c,[CURLOPT_POST=>true,CURLOPT_POSTFIELDS=>['chat_id'=>$ch,'text'=>$msg,'parse_mode'=>'HTML'],CURLOPT_RETURNTRANSFER=>true,CURLOPT_TIMEOUT=>10,CURLOPT_SSL_VERIFYPEER=>false]);
+        curl_exec($c); curl_close($c);
+    }
 }
 
-// Flash message
-$flash = $_SESSION['flash'] ?? null;
-unset($_SESSION['flash']);
+// ============================================================
+// BACKUP (Shahan panel compatible)
+// ============================================================
+function createBackup() {
+    $users=getUsers();
+    $ts=date('Y-m-d_H-i-s');
+    $fn="backup_{$ts}.sql";
+    $fp=BACKUP_DIR.'/'.$fn;
 
-// Get data for current page
-$stats = getPanelStats();
-$users = getUsers();
-$settings = getAllSettings();
-$onlineUsers = array_filter($users, fn($u) => $u['is_online']);
-$chatIds = getTelegramChatIds();
-$backups = getBackups();
-$serverIP = getServerIP();
-$isRoot = isRunningAsRoot();
+    // Shahan-compatible format
+    $sql="-- Shahan SSH Panel Backup\n-- Date: ".date('Y-m-d H:i:s')."\n-- Users: ".count($users)."\n\n";
+    $sql.="CREATE TABLE IF NOT EXISTS users (\n";
+    $sql.="  id INTEGER PRIMARY KEY AUTOINCREMENT,\n";
+    $sql.="  username TEXT UNIQUE NOT NULL,\n";
+    $sql.="  password TEXT NOT NULL,\n";
+    $sql.="  traffic INTEGER DEFAULT 0,\n";
+    $sql.="  traffic_used REAL DEFAULT 0,\n";
+    $sql.="  expdate TEXT NOT NULL,\n";
+    $sql.="  multiuser INTEGER DEFAULT 1,\n";
+    $sql.="  status TEXT DEFAULT 'active',\n";
+    $sql.="  bandwidth INTEGER DEFAULT 0,\n";
+    $sql.="  created_at TEXT DEFAULT CURRENT_TIMESTAMP\n";
+    $sql.=");\n\n";
+    $sql.="DELETE FROM users;\n\n";
 
+    foreach($users as $u) {
+        $status = $u['is_enabled'] ? 'active' : 'deactive';
+        if(strtotime($u['expires_at'])<time()) $status = 'expired';
+        $traffic = (int)$u['data_limit']; // MB
+        $sql.=sprintf("INSERT INTO users (username, password, traffic, traffic_used, expdate, multiuser, status, bandwidth, created_at) VALUES ('%s', '%s', %d, %.2f, '%s', %d, '%s', %d, '%s');\n",
+            SQLite3::escapeString($u['username']),
+            SQLite3::escapeString($u['password']),
+            $traffic,
+            $u['data_used'],
+            date('Y-m-d', strtotime($u['expires_at'])),
+            $u['max_conn'],
+            $status,
+            $u['bw_limit'],
+            $u['created_at']
+        );
+    }
+    file_put_contents($fp,$sql);
+    return ['fn'=>$fn,'fp'=>$fp];
+}
+
+// ============================================================
+// QR CONFIGS (CORRECT FORMATS)
+// ============================================================
+function getConfigs($user) {
+    $ip = getServerIP();
+    $port = (int)getSetting('ssh_port','22');
+    $u = $user['username'];
+    $p = $user['password'];
+
+    // --- NetMod / V2Box: ssh://user:pass@host:port#remark ---
+    $netmod_uri = "ssh://{$u}:{$p}@{$ip}:{$port}#{$u}";
+
+    // --- NapsternetV: npvt-ssh:// + base64 JSON ---
+    $npv_json = json_encode([
+        "sshConfigType" => "SSH-Direct",
+        "sni" => "",
+        "tlsVersion" => "DEFAULT",
+        "httpProxy" => "",
+        "authenticateProxy" => false,
+        "proxyUsername" => "",
+        "proxyPassword" => "",
+        "payload" => "",
+        "dnsTTMode" => "UDP",
+        "dnsServer" => "",
+        "nameserver" => "",
+        "publicKey" => "",
+        "udpgwPort" => 0,
+        "remarks" => $u,
+        "sshHost" => $ip,
+        "sshPort" => $port,
+        "sshUsername" => $u,
+        "sshPassword" => $p,
+        "udpgwTransparentDNS" => true
+    ], JSON_UNESCAPED_SLASHES);
+    $npv_uri = "npvt-ssh://" . base64_encode($npv_json);
+
+    // --- Rocket SSH: rocket-ssh:// + base64 JSON ---
+    $rocket_json = json_encode([
+        "host" => $ip,
+        "port" => $port,
+        "username" => $u,
+        "password" => $p,
+        "remark" => $u,
+        "udpgw" => "127.0.0.1:7300"
+    ], JSON_UNESCAPED_SLASHES);
+    $rocket_uri = "rocket-ssh://" . base64_encode($rocket_json);
+
+    // --- MRZ VPN (v2box style) ---
+    $mrz_uri = "ssh://{$u}:{$p}@{$ip}:{$port}#{$u}";
+
+    return [
+        ['name'=>'NetMod','icon'=>'🔧','uri'=>$netmod_uri],
+        ['name'=>'NapsternetV','icon'=>'🌐','uri'=>$npv_uri],
+        ['name'=>'Rocket SSH','icon'=>'🚀','uri'=>$rocket_uri],
+        ['name'=>'V2Box / MRZ','icon'=>'📦','uri'=>$mrz_uri],
+    ];
+}
+
+// ============================================================
+// HELPERS
+// ============================================================
+function rndPass($n=12) { $c='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'; $p=''; for($i=0;$i<$n;$i++) $p.=$c[random_int(0,strlen($c)-1)]; return $p; }
+function fmtData($mb) { return $mb>=1024?round($mb/1024,1).' GB':round($mb).' MB'; }
+function daysLeft($e) { return (int)ceil((strtotime($e)-time())/86400); }
+function isRoot() { return function_exists('posix_getuid')&&posix_getuid()===0; }
+
+// ============================================================
+// ROUTING
+// ============================================================
+$page=$_GET['page']??'login';
+$action=$_POST['action']??'';
+$flash=$_SESSION['flash']??null; unset($_SESSION['flash']);
+$isAdmin=isset($_SESSION['admin'])&&$_SESSION['admin']===true;
+$isUser=isset($_SESSION['user_id']);
+try{syncOnline();}catch(Exception $e){}
+
+if($page==='logout'){session_destroy();header('Location:?page=login');exit;}
+if($page==='user_logout'){unset($_SESSION['user_id']);header('Location:?page=user_login');exit;}
+
+if($page==='login'&&$_SERVER['REQUEST_METHOD']==='POST'){
+    $u=$_POST['username']??'';$p=$_POST['password']??'';
+    if($u===getSetting('admin_user','admin')&&$p===getSetting('admin_pass','admin')){$_SESSION['admin']=true;header('Location:?page=dashboard');exit;}
+    $loginError='Invalid credentials';
+}
+if($page==='user_login'&&$_SERVER['REQUEST_METHOD']==='POST'){
+    $u=$_POST['username']??'';$p=$_POST['password']??'';$usr=getUserByUsername($u);
+    if($usr&&$usr['password']===$p){$_SESSION['user_id']=$usr['id'];header('Location:?page=my_account');exit;}
+    $userLoginError='Invalid credentials';
+}
+if(in_array($page,['dashboard','users','online','settings'])&&!$isAdmin){header('Location:?page=login');exit;}
+if($page==='my_account'&&!$isUser){header('Location:?page=user_login');exit;}
+if($isAdmin&&$page==='login'){header('Location:?page=dashboard');exit;}
+
+// Handle actions
+if($isAdmin&&$action){
+    switch($action){
+        case 'create_user':
+            $un=trim($_POST['username']??'');$pw=$_POST['password']??'';if(!$pw)$pw=rndPass();
+            if(strlen($un)>=3){
+                $r=createUser(['username'=>$un,'password'=>$pw,'expires_at'=>date('Y-m-d H:i:s',time()+(int)($_POST['days']??30)*86400),'max_conn'=>(int)($_POST['max_conn']??1),'data_limit'=>(float)($_POST['data_limit']??0),'bw_limit'=>(int)($_POST['bw_limit']??0)]);
+                $_SESSION['flash']=$r['ok']?"User '$un' created!":"Error: ".($r['err']??'');
+            } header('Location:?page=users');exit;
+        case 'delete_user':
+            $u=getUserById((int)($_POST['id']??0)); if($u){deleteUser($u['id']);$_SESSION['flash']="User '{$u['username']}' deleted!";} header('Location:?page=users');exit;
+        case 'toggle_user':
+            toggleUser((int)($_POST['id']??0)); header('Location:?page=users');exit;
+        case 'kick_user':
+            $u=getUserById((int)($_POST['id']??0)); if($u){kickUser($u['username']);updateUserDB($u['id'],['is_online'=>0,'cur_conn'=>0,'ips'=>'']);$_SESSION['flash']="Kicked!";} header('Location:?page=online');exit;
+        case 'update_user':
+            $u=getUserById((int)($_POST['id']??0)); if($u){
+                $d=[]; if(!empty($_POST['password'])){$d['password']=$_POST['password'];$su=escapeshellarg($u['username']);$sp=escapeshellarg($_POST['password']);exec("echo $su:$sp|chpasswd 2>/dev/null");}
+                if(isset($_POST['days']))$d['expires_at']=date('Y-m-d H:i:s',time()+(int)$_POST['days']*86400);
+                if(isset($_POST['max_conn']))$d['max_conn']=(int)$_POST['max_conn'];
+                if(isset($_POST['data_limit']))$d['data_limit']=(float)$_POST['data_limit'];
+                if(isset($_POST['bw_limit']))$d['bw_limit']=(int)$_POST['bw_limit'];
+                if($d)updateUserDB($u['id'],$d); $_SESSION['flash']="Updated!";
+            } header('Location:?page=users');exit;
+        case 'reset_data':
+            updateUserDB((int)($_POST['id']??0),['data_used'=>0]); $_SESSION['flash']="Data reset!"; header('Location:?page=users');exit;
+        case 'save_settings':
+            if(!empty($_POST['ssh_port']))changeSSHPort((int)$_POST['ssh_port']);
+            if(!empty($_POST['admin_user']))setSetting('admin_user',$_POST['admin_user']);
+            if(!empty($_POST['admin_pass']))setSetting('admin_pass',$_POST['admin_pass']);
+            if(isset($_POST['server_ip']))setSetting('server_ip',$_POST['server_ip']);
+            if(isset($_POST['tg_token']))setSetting('tg_token',$_POST['tg_token']);
+            $_SESSION['flash']="Saved!"; header('Location:?page=settings');exit;
+        case 'add_chat': $c=trim($_POST['chat_id']??''); if($c)addTgChat($c); header('Location:?page=settings');exit;
+        case 'remove_chat': removeTgChat($_POST['chat_id']??''); header('Location:?page=settings');exit;
+        case 'test_telegram': sendTgMsg("✅ <b>SSH Panel Test</b>\n📅 ".date('Y-m-d H:i:s')."\n🖥 ".getServerIP()); $_SESSION['flash']="Sent!"; header('Location:?page=settings');exit;
+        case 'backup':
+            $b=createBackup(); header('Content-Type:application/sql'); header('Content-Disposition:attachment;filename="'.$b['fn'].'"'); readfile($b['fp']); exit;
+        case 'telegram_backup':
+            $b=createBackup(); $tk=getSetting('tg_token');
+            foreach(getTgChats() as $ch){$c=curl_init("https://api.telegram.org/bot{$tk}/sendDocument");curl_setopt_array($c,[CURLOPT_POST=>true,CURLOPT_POSTFIELDS=>['chat_id'=>$ch,'document'=>new CURLFile($b['fp']),'caption'=>"📦 Backup ".date('Y-m-d H:i:s')],CURLOPT_RETURNTRANSFER=>true,CURLOPT_TIMEOUT=>30,CURLOPT_SSL_VERIFYPEER=>false]);curl_exec($c);curl_close($c);}
+            $_SESSION['flash']="Backup sent!"; header('Location:?page=settings');exit;
+    }
+}
+
+$users=getUsers(); $onlineUsers=array_filter($users,fn($u)=>$u['is_online']); $totalData=array_sum(array_column($users,'data_used'));
+$expiredCount=count(array_filter($users,fn($u)=>daysLeft($u['expires_at'])<=0)); $pausedCount=count(array_filter($users,fn($u)=>!$u['is_enabled']));
+$serverIP=getServerIP(); $sshPort=getSetting('ssh_port','22'); $tgChats=getTgChats();
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SSH Panel Manager</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <script>
-    tailwind.config = {
-        theme: {
-            extend: {
-                colors: {
-                    dark: { 900: '#0a0e17', 800: '#111827', 700: '#1a2235', 600: '#243049', 500: '#2d3a52' },
-                    accent: { DEFAULT: '#3b82f6', light: '#60a5fa', dark: '#2563eb' },
-                },
-                fontFamily: { sans: ['Inter', 'system-ui', 'sans-serif'] }
-            }
-        }
-    }
-    </script>
-    <style>
-        body { background: #0a0e17; font-family: 'Inter', system-ui, sans-serif; }
-        * { scrollbar-width: thin; scrollbar-color: #2d3a52 #111827; }
-        .glass { background: linear-gradient(135deg, rgba(26,34,53,0.8), rgba(17,24,39,0.9)); border: 1px solid rgba(59,130,246,0.15); backdrop-filter: blur(10px); }
-        .glow { box-shadow: 0 0 15px rgba(59,130,246,0.1), inset 0 0 15px rgba(59,130,246,0.05); }
-        .stat-card { background: linear-gradient(135deg, rgba(26,34,53,0.9), rgba(17,24,39,0.95)); border: 1px solid rgba(59,130,246,0.2); transition: all 0.3s; }
-        .stat-card:hover { border-color: rgba(59,130,246,0.4); transform: translateY(-2px); box-shadow: 0 8px 25px rgba(59,130,246,0.15); }
-        .sidebar-item { transition: all 0.2s; border-left: 3px solid transparent; }
-        .sidebar-item:hover { background: rgba(59,130,246,0.1); border-left-color: rgba(59,130,246,0.5); }
-        .sidebar-item.active { background: rgba(59,130,246,0.15); border-left-color: #3b82f6; color: #60a5fa; }
-        .btn-primary { background: linear-gradient(135deg, #3b82f6, #2563eb); transition: all 0.2s; }
-        .btn-primary:hover { background: linear-gradient(135deg, #60a5fa, #3b82f6); box-shadow: 0 4px 15px rgba(59,130,246,0.3); }
-        .btn-danger { background: linear-gradient(135deg, #ef4444, #dc2626); }
-        .btn-danger:hover { background: linear-gradient(135deg, #f87171, #ef4444); }
-        .btn-success { background: linear-gradient(135deg, #10b981, #059669); }
-        .btn-warning { background: linear-gradient(135deg, #f59e0b, #d97706); }
-        .input-field { background: rgba(10,14,23,0.8); border: 1px solid rgba(59,130,246,0.2); transition: all 0.2s; }
-        .input-field:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,0.1); }
-        .table-row { border-bottom: 1px solid rgba(59,130,246,0.08); transition: background 0.2s; }
-        .table-row:hover { background: rgba(59,130,246,0.05); }
-        .badge { padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
-        .badge-online { background: rgba(16,185,129,0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.3); }
-        .badge-offline { background: rgba(107,114,128,0.15); color: #9ca3af; border: 1px solid rgba(107,114,128,0.3); }
-        .badge-expired { background: rgba(239,68,68,0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.3); }
-        .badge-paused { background: rgba(245,158,11,0.15); color: #fbbf24; border: 1px solid rgba(245,158,11,0.3); }
-        .badge-active { background: rgba(59,130,246,0.15); color: #60a5fa; border: 1px solid rgba(59,130,246,0.3); }
-        .progress-bar { background: rgba(59,130,246,0.15); border-radius: 10px; height: 8px; overflow: hidden; }
-        .progress-fill { border-radius: 10px; height: 100%; transition: width 0.5s; }
-        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
-        .pulse-dot { animation: pulse 2s infinite; }
-        @keyframes fadeIn { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
-        .fade-in { animation: fadeIn 0.3s ease forwards; }
-        .modal-bg { background: rgba(0,0,0,0.7); backdrop-filter: blur(4px); }
-        .qr-card { border: 1px solid rgba(59,130,246,0.2); }
-        .preset-btn { cursor: pointer; }
-        .preset-btn:hover { background: rgba(59,130,246,0.2) !important; color: white !important; }
-    </style>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>SSH Panel</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+body{background:#0a0e17;font-family:system-ui,sans-serif}
+.card{background:linear-gradient(135deg,#1a2235,#111827);border:1px solid rgba(59,130,246,.15)}
+.inp{background:#0a0e17;border:1px solid rgba(59,130,246,.2);color:#e2e8f0;border-radius:8px;padding:8px 14px;width:100%;font-size:14px}
+.inp:focus{border-color:#3b82f6;outline:none}
+.btn{background:linear-gradient(135deg,#3b82f6,#2563eb);color:#fff;font-weight:600;border-radius:8px;border:none;cursor:pointer;transition:.2s}
+.btn:hover{filter:brightness(1.15)}
+.btn-r{background:linear-gradient(135deg,#ef4444,#dc2626)}
+.btn-g{background:linear-gradient(135deg,#10b981,#059669)}
+.btn-y{background:linear-gradient(135deg,#f59e0b,#d97706)}
+.si{border-left:3px solid transparent;transition:.2s}.si:hover,.si.a{background:rgba(59,130,246,.1);border-left-color:#3b82f6}.si.a{color:#60a5fa}
+.bdg{padding:2px 10px;border-radius:20px;font-size:11px;font-weight:600}
+.pulse{animation:p 2s infinite}@keyframes p{0%,100%{opacity:1}50%{opacity:.4}}
+.pre{cursor:pointer;transition:.15s;user-select:none}.pre:hover{background:rgba(59,130,246,.3)!important;color:#fff!important}
+.mbg{background:rgba(0,0,0,.75);backdrop-filter:blur(4px)}
+</style>
 </head>
 <body class="text-gray-200 min-h-screen">
 
-<?php if ($flash): ?>
-<div id="flash-msg" class="fixed top-4 right-4 z-[100] px-6 py-3 rounded-xl text-sm font-medium fade-in <?= strpos($flash, 'Error') !== false || strpos($flash, 'Warning') !== false ? 'bg-red-500/20 text-red-400 border border-red-500/30' : 'bg-green-500/20 text-green-400 border border-green-500/30' ?>">
-    <?= htmlspecialchars($flash) ?>
-</div>
-<script>setTimeout(()=>document.getElementById('flash-msg')?.remove(), 5000);</script>
-<?php endif; ?>
-
-<?php if (!$isRoot && $isAdminLoggedIn): ?>
-<div class="fixed top-4 left-1/2 -translate-x-1/2 z-[90] px-4 py-2 rounded-lg text-xs bg-yellow-500/20 text-yellow-400 border border-yellow-500/30">
-    ⚠️ Not running as root - system user management disabled (demo mode)
-</div>
-<?php endif; ?>
+<?php if($flash):?><div id="fl" class="fixed top-4 right-4 z-50 px-5 py-3 rounded-xl text-sm font-medium bg-green-500/20 text-green-400 border border-green-500/30"><?=htmlspecialchars($flash)?></div><script>setTimeout(()=>document.getElementById('fl')?.remove(),4000)</script><?php endif;?>
 
 <?php
-// ============================================================
-//  ADMIN LOGIN PAGE
-// ============================================================
-if ($page === 'login'): ?>
+// ================== ADMIN LOGIN ==================
+if($page==='login'):?>
 <div class="min-h-screen flex items-center justify-center p-4">
-    <div class="w-full max-w-md fade-in">
-        <div class="text-center mb-8">
-            <div class="w-20 h-20 mx-auto rounded-2xl bg-gradient-to-br from-blue-500 via-blue-600 to-purple-600 flex items-center justify-center mb-4 shadow-lg shadow-blue-500/20">
-                <svg class="w-10 h-10 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
-            </div>
-            <h1 class="text-3xl font-bold text-white">SSH Panel</h1>
-            <p class="text-gray-400 mt-1">Administration Dashboard</p>
-        </div>
-        <div class="glass glow rounded-2xl p-8">
-            <h2 class="text-lg font-semibold text-white mb-6 flex items-center gap-2">
-                <svg class="w-5 h-5 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
-                Admin Login
-            </h2>
-            <form method="POST" class="space-y-4">
-                <div>
-                    <label class="block text-sm text-gray-400 mb-1">Username</label>
-                    <input type="text" name="username" class="input-field w-full rounded-lg px-4 py-3 text-white" placeholder="admin" value="admin" required>
-                </div>
-                <div>
-                    <label class="block text-sm text-gray-400 mb-1">Password</label>
-                    <input type="password" name="password" class="input-field w-full rounded-lg px-4 py-3 text-white" placeholder="admin" required>
-                </div>
-                <?php if (isset($loginError)): ?>
-                <div class="text-red-400 text-sm bg-red-500/10 border border-red-500/20 rounded-lg p-3 text-center"><?= htmlspecialchars($loginError) ?></div>
-                <?php endif; ?>
-                <button type="submit" class="btn-primary w-full py-3 text-base rounded-lg text-white font-semibold">Login to Panel</button>
-            </form>
-            <div class="mt-6 pt-4 border-t border-gray-700/50 text-center">
-                <p class="text-gray-500 text-sm mb-2">Are you an SSH user?</p>
-                <a href="?page=user_login" class="text-blue-400 hover:text-blue-300 text-sm font-medium">Login to My Account →</a>
-            </div>
-        </div>
-        <p class="text-center text-gray-600 text-xs mt-6">SSH Panel Manager v<?= PANEL_VERSION ?> • Default: admin / admin</p>
-    </div>
-</div>
+<div class="w-full max-w-md">
+<div class="text-center mb-8"><div class="w-20 h-20 mx-auto rounded-2xl bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center mb-4 shadow-lg shadow-blue-500/30 text-4xl">🖥️</div><h1 class="text-3xl font-bold text-white">SSH Panel</h1><p class="text-gray-500 mt-1 text-sm">Admin Dashboard</p></div>
+<div class="card rounded-2xl p-8">
+<form method="POST" class="space-y-4">
+<div><label class="block text-xs text-gray-400 mb-1">Username</label><input type="text" name="username" value="admin" class="inp" required></div>
+<div><label class="block text-xs text-gray-400 mb-1">Password</label><input type="password" name="password" class="inp" placeholder="admin" required></div>
+<?php if(isset($loginError)):?><p class="text-red-400 text-sm text-center bg-red-500/10 border border-red-500/20 rounded-lg p-2"><?=$loginError?></p><?php endif;?>
+<button type="submit" class="btn w-full py-3">Login</button>
+</form>
+<div class="mt-6 pt-4 border-t border-gray-700/40 text-center"><a href="?page=user_login" class="text-blue-400 hover:text-blue-300 text-sm font-medium">SSH User Login →</a></div>
+</div></div></div>
 
 <?php
-// ============================================================
-//  USER LOGIN PAGE
-// ============================================================
-elseif ($page === 'user_login'): ?>
+// ================== USER LOGIN ==================
+elseif($page==='user_login'):?>
 <div class="min-h-screen flex items-center justify-center p-4">
-    <div class="glass glow rounded-2xl p-8 w-full max-w-md fade-in">
-        <div class="text-center mb-8">
-            <div class="w-16 h-16 mx-auto rounded-2xl bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center mb-4">
-                <svg class="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>
-            </div>
-            <h1 class="text-2xl font-bold text-white">My Account</h1>
-            <p class="text-gray-400 text-sm mt-1">Login to view your SSH account</p>
-        </div>
-        <form method="POST" class="space-y-4">
-            <div>
-                <label class="block text-sm text-gray-400 mb-1">Username</label>
-                <input type="text" name="username" class="input-field w-full rounded-lg px-4 py-3 text-white" placeholder="Your SSH username" required>
-            </div>
-            <div>
-                <label class="block text-sm text-gray-400 mb-1">Password</label>
-                <input type="password" name="password" class="input-field w-full rounded-lg px-4 py-3 text-white" placeholder="Your password" required>
-            </div>
-            <?php if (isset($userLoginError)): ?>
-            <div class="text-red-400 text-sm bg-red-500/10 border border-red-500/20 rounded-lg p-3 text-center"><?= htmlspecialchars($userLoginError) ?></div>
-            <?php endif; ?>
-            <button type="submit" class="btn-primary w-full py-3 rounded-lg text-white font-semibold">Login</button>
-        </form>
-        <p class="text-center text-gray-500 text-xs mt-6">
-            <a href="?page=login" class="text-gray-500 hover:text-gray-400">← Admin Login</a>
-        </p>
-    </div>
-</div>
+<div class="card rounded-2xl p-8 w-full max-w-md">
+<div class="text-center mb-8"><div class="w-16 h-16 mx-auto rounded-2xl bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center mb-4 text-3xl">👤</div><h1 class="text-2xl font-bold text-white">My Account</h1></div>
+<form method="POST" class="space-y-4">
+<div><label class="block text-xs text-gray-400 mb-1">Username</label><input type="text" name="username" class="inp" required></div>
+<div><label class="block text-xs text-gray-400 mb-1">Password</label><input type="password" name="password" class="inp" required></div>
+<?php if(isset($userLoginError)):?><p class="text-red-400 text-sm text-center bg-red-500/10 rounded-lg p-2"><?=$userLoginError?></p><?php endif;?>
+<button type="submit" class="btn w-full py-3">Login</button>
+</form>
+<p class="text-center mt-5"><a href="?page=login" class="text-gray-500 text-xs">← Admin</a></p>
+</div></div>
 
 <?php
-// ============================================================
-//  USER DASHBOARD (MY ACCOUNT)
-// ============================================================
-elseif ($page === 'my_account' && $isUserLoggedIn):
-    $myUser = getUserById($_SESSION['user_id']);
-    if (!$myUser) { header('Location: ?page=user_logout'); exit; }
-    $daysLeft = getDaysLeft($myUser['expires_at']);
-    $isExpired = $daysLeft <= 0;
-    $dataPercent = $myUser['data_limit'] > 0 ? min(($myUser['data_used'] / $myUser['data_limit']) * 100, 100) : 0;
-    $configs = generateConnectionConfigs($myUser);
+// ================== USER DASHBOARD ==================
+elseif($page==='my_account'&&$isUser):
+$me=getUserById($_SESSION['user_id']); if(!$me){header('Location:?page=user_logout');exit;}
+$dl=daysLeft($me['expires_at']); $exp=$dl<=0; $dp=$me['data_limit']>0?min(($me['data_used']/$me['data_limit'])*100,100):0;
+$cfgs=getConfigs($me);
 ?>
-<div class="min-h-screen p-4 md:p-8">
-    <div class="max-w-4xl mx-auto fade-in">
-        <div class="flex items-center justify-between mb-6">
-            <div class="flex items-center gap-3">
-                <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center">
-                    <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>
-                </div>
-                <div>
-                    <h1 class="text-xl font-bold text-white">Welcome, <?= htmlspecialchars($myUser['username']) ?></h1>
-                    <p class="text-sm text-gray-400">Your SSH Account</p>
-                </div>
-            </div>
-            <a href="?page=user_logout" class="flex items-center gap-2 text-gray-400 hover:text-white">Logout</a>
-        </div>
-
-        <!-- Stats -->
-        <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-            <div class="stat-card rounded-2xl p-4">
-                <p class="text-gray-400 text-sm">⏱️ Time Left</p>
-                <p class="text-2xl font-bold mt-1 <?= $isExpired ? 'text-red-400' : ($daysLeft <= 3 ? 'text-yellow-400' : 'text-green-400') ?>"><?= $isExpired ? 'Expired' : "{$daysLeft}d" ?></p>
-                <p class="text-xs text-gray-500 mt-1"><?= date('Y-m-d', strtotime($myUser['expires_at'])) ?></p>
-            </div>
-            <div class="stat-card rounded-2xl p-4">
-                <p class="text-gray-400 text-sm">📊 Data Used</p>
-                <p class="text-2xl font-bold text-cyan-400 mt-1"><?= formatDataSize($myUser['data_used']) ?></p>
-                <?php if ($myUser['data_limit'] > 0): ?>
-                <div class="progress-bar mt-2"><div class="progress-fill" style="width:<?= $dataPercent ?>%;background:<?= $dataPercent > 90 ? '#ef4444' : ($dataPercent > 70 ? '#f59e0b' : '#3b82f6') ?>"></div></div>
-                <p class="text-xs text-gray-500 mt-1">of <?= formatDataSize($myUser['data_limit']) ?></p>
-                <?php else: ?>
-                <p class="text-xs text-gray-500 mt-1">Unlimited</p>
-                <?php endif; ?>
-            </div>
-            <div class="stat-card rounded-2xl p-4">
-                <p class="text-gray-400 text-sm">📶 Connections</p>
-                <p class="text-2xl font-bold text-purple-400 mt-1"><?= $myUser['current_connections'] ?><span class="text-gray-500 text-lg">/<?= $myUser['max_connections'] ?></span></p>
-                <p class="text-xs mt-1 <?= $myUser['is_online'] ? 'text-green-400' : 'text-gray-500' ?>"><?= $myUser['is_online'] ? '● Online' : 'Offline' ?></p>
-            </div>
-            <div class="stat-card rounded-2xl p-4">
-                <p class="text-gray-400 text-sm">🚀 Bandwidth</p>
-                <p class="text-2xl font-bold text-yellow-400 mt-1"><?= $myUser['bandwidth_limit'] > 0 ? $myUser['bandwidth_limit'].'Kbps' : '∞' ?></p>
-            </div>
-        </div>
-
-        <!-- Server Info -->
-        <div class="glass glow rounded-2xl p-5 mb-6">
-            <h3 class="text-lg font-semibold text-white mb-4">🖥️ Connection Info</h3>
-            <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
-                <div class="bg-dark-900/50 rounded-lg p-3"><span class="text-gray-500">Server</span><p class="text-white font-mono mt-0.5"><?= htmlspecialchars($serverIP) ?></p></div>
-                <div class="bg-dark-900/50 rounded-lg p-3"><span class="text-gray-500">SSH Port</span><p class="text-white font-mono mt-0.5"><?= htmlspecialchars($settings['ssh_port'] ?? '22') ?></p></div>
-                <div class="bg-dark-900/50 rounded-lg p-3"><span class="text-gray-500">Username</span><p class="text-white font-mono mt-0.5"><?= htmlspecialchars($myUser['username']) ?></p></div>
-                <div class="bg-dark-900/50 rounded-lg p-3"><span class="text-gray-500">Status</span><p class="mt-0.5"><span class="badge <?= $isExpired ? 'badge-expired' : (!$myUser['is_enabled'] ? 'badge-paused' : 'badge-active') ?>"><?= $isExpired ? 'Expired' : (!$myUser['is_enabled'] ? 'Paused' : 'Active') ?></span></p></div>
-            </div>
-        </div>
-
-        <!-- QR Codes -->
-        <div class="glass glow rounded-2xl p-5">
-            <h3 class="text-lg font-semibold text-white mb-4">📱 Connection QR Codes</h3>
-            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4" id="user-qr-container">
-                <?php foreach ($configs as $i => $config): ?>
-                <div class="glass qr-card rounded-xl p-4">
-                    <div class="flex items-center gap-2 mb-3">
-                        <span class="text-xl"><?= $config['icon'] ?></span>
-                        <h4 class="font-semibold text-white"><?= $config['name'] ?></h4>
-                    </div>
-                    <div class="flex justify-center mb-3">
-                        <div class="bg-white p-2.5 rounded-lg">
-                            <canvas id="qr-user-<?= $i ?>" width="140" height="140"></canvas>
-                        </div>
-                    </div>
-                    <div class="bg-dark-900/80 rounded-lg p-2 mb-3">
-                        <p class="text-xs text-gray-400 break-all font-mono leading-relaxed max-h-14 overflow-y-auto" id="uri-user-<?= $i ?>"><?= htmlspecialchars($config['uri']) ?></p>
-                    </div>
-                    <button onclick="copyUri('uri-user-<?= $i ?>', this)" class="w-full py-2 px-3 rounded-lg text-sm font-medium bg-blue-500/10 text-blue-400 border border-blue-500/20 hover:bg-blue-500/20 transition-all">📋 Copy Link</button>
-                </div>
-                <?php endforeach; ?>
-            </div>
-        </div>
-    </div>
+<div class="min-h-screen p-4 md:p-8"><div class="max-w-4xl mx-auto">
+<div class="flex items-center justify-between mb-6">
+<div class="flex items-center gap-3"><div class="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-lg">👤</div><div><h1 class="text-xl font-bold text-white"><?=htmlspecialchars($me['username'])?></h1><p class="text-xs text-gray-400">SSH Account</p></div></div>
+<a href="?page=user_logout" class="text-gray-400 hover:text-white text-sm">Logout</a>
 </div>
+<div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
+<div class="card rounded-2xl p-4"><p class="text-gray-400 text-xs">⏱ Time</p><p class="text-2xl font-bold mt-1 <?=$exp?'text-red-400':($dl<=3?'text-yellow-400':'text-green-400')?>"><?=$exp?'Expired':$dl.'d'?></p></div>
+<div class="card rounded-2xl p-4"><p class="text-gray-400 text-xs">📊 Data</p><p class="text-2xl font-bold text-cyan-400 mt-1"><?=fmtData($me['data_used'])?></p><?php if($me['data_limit']>0):?><div class="h-1.5 bg-blue-500/20 rounded-full mt-2"><div class="h-full rounded-full" style="width:<?=$dp?>%;background:<?=$dp>90?'#ef4444':($dp>70?'#f59e0b':'#3b82f6')?>"></div></div><p class="text-[10px] text-gray-500 mt-0.5">/ <?=fmtData($me['data_limit'])?></p><?php endif;?></div>
+<div class="card rounded-2xl p-4"><p class="text-gray-400 text-xs">📶 Conn</p><p class="text-2xl font-bold text-purple-400 mt-1"><?=$me['cur_conn']?><span class="text-gray-500 text-base">/<?=$me['max_conn']?></span></p></div>
+<div class="card rounded-2xl p-4"><p class="text-gray-400 text-xs">🚀 BW</p><p class="text-2xl font-bold text-yellow-400 mt-1"><?=$me['bw_limit']>0?$me['bw_limit'].'K':'∞'?></p></div>
+</div>
+<div class="card rounded-2xl p-5 mb-6">
+<h3 class="text-base font-semibold text-white mb-3">🖥️ Server</h3>
+<div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
+<div class="bg-[#0a0e17]/50 rounded-lg p-3"><span class="text-gray-500 text-xs">IP</span><p class="text-white font-mono mt-0.5 text-sm"><?=$serverIP?></p></div>
+<div class="bg-[#0a0e17]/50 rounded-lg p-3"><span class="text-gray-500 text-xs">Port</span><p class="text-white font-mono mt-0.5"><?=$sshPort?></p></div>
+<div class="bg-[#0a0e17]/50 rounded-lg p-3"><span class="text-gray-500 text-xs">User</span><p class="text-white font-mono mt-0.5"><?=htmlspecialchars($me['username'])?></p></div>
+<div class="bg-[#0a0e17]/50 rounded-lg p-3"><span class="text-gray-500 text-xs">Status</span><p class="mt-0.5"><span class="bdg <?=$exp?'bg-red-500/20 text-red-400':(!$me['is_enabled']?'bg-yellow-500/20 text-yellow-400':'bg-blue-500/20 text-blue-400')?>"><?=$exp?'Expired':(!$me['is_enabled']?'Paused':'Active')?></span></p></div>
+</div></div>
+<div class="card rounded-2xl p-5"><h3 class="text-base font-semibold text-white mb-4">📱 Connection Configs</h3>
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+<?php foreach($cfgs as $i=>$cfg):?>
+<div class="bg-[#0a0e17]/50 border border-blue-500/10 rounded-xl p-4">
+<p class="font-semibold text-white mb-3"><?=$cfg['icon']?> <?=$cfg['name']?></p>
+<div class="flex justify-center mb-3"><img id="qr-u-<?=$i?>" class="rounded-lg" width="140" height="140" alt="QR"></div>
+<div class="bg-[#0a0e17] rounded-lg p-2 mb-3"><p class="text-[10px] text-gray-400 break-all font-mono max-h-12 overflow-y-auto" id="uri-u-<?=$i?>"><?=htmlspecialchars($cfg['uri'])?></p></div>
+<button onclick="cpU('uri-u-<?=$i?>',this)" class="w-full py-2 rounded-lg text-sm bg-blue-500/10 text-blue-400 border border-blue-500/20 hover:bg-blue-500/20">📋 Copy</button>
+</div>
+<?php endforeach;?>
+</div></div></div></div>
+<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
 <script>
-document.addEventListener('DOMContentLoaded', function() {
-    <?php foreach ($configs as $i => $config): ?>
-    try {
-        QRCode.toCanvas(document.getElementById('qr-user-<?= $i ?>'), <?= json_encode($config['uri']) ?>, {width:140,margin:0,color:{dark:'#000',light:'#fff'}});
-    } catch(e) { console.error('QR error:', e); }
-    <?php endforeach; ?>
+function cpU(id,b){navigator.clipboard.writeText(document.getElementById(id).textContent);b.textContent='✅ Copied!';setTimeout(()=>b.textContent='📋 Copy',1500)}
+document.addEventListener('DOMContentLoaded',function(){
+<?php foreach($cfgs as $i=>$cfg):?>
+QRCode.toDataURL(<?=json_encode($cfg['uri'])?>,{width:140,margin:1},function(e,url){if(!e)document.getElementById('qr-u-<?=$i?>').src=url;});
+<?php endforeach;?>
 });
 </script>
 
 <?php
-// ============================================================
-//  ADMIN PANEL
-// ============================================================
-elseif ($isAdminLoggedIn): ?>
+// ================== ADMIN PANEL ==================
+elseif($isAdmin):?>
 <div class="flex min-h-screen">
-    <!-- Sidebar -->
-    <button id="mobile-toggle" onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full')" class="lg:hidden fixed top-4 left-4 z-50 p-2 rounded-lg bg-dark-800 border border-blue-500/20 text-white">☰</button>
-
-    <aside id="sidebar" class="fixed lg:static top-0 left-0 z-40 h-screen w-64 flex flex-col -translate-x-full lg:translate-x-0 transition-transform duration-300" style="background:linear-gradient(180deg,#111827,#0d1321);border-right:1px solid rgba(59,130,246,0.1)">
-        <div class="p-5 border-b border-blue-500/10">
-            <div class="flex items-center gap-3">
-                <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center shadow-lg shadow-blue-500/20">🖥️</div>
-                <div><h1 class="text-lg font-bold text-white">SSH Panel</h1><p class="text-xs text-gray-500">v<?= PANEL_VERSION ?></p></div>
-            </div>
-        </div>
-        <nav class="flex-1 py-4 px-3 space-y-1">
-            <?php foreach ([
-                ['dashboard', '📊 Dashboard', $stats['total_users']],
-                ['users', '👥 Users', count($users)],
-                ['online', '🟢 Online', $stats['online_users']],
-                ['settings', '⚙️ Settings', null],
-            ] as $item): ?>
-            <a href="?page=<?= $item[0] ?>" class="sidebar-item flex items-center justify-between gap-3 px-4 py-3 rounded-lg text-sm font-medium <?= $page === $item[0] ? 'active' : 'text-gray-400 hover:text-white' ?>">
-                <span><?= $item[1] ?></span>
-                <?php if ($item[2] !== null): ?><span class="text-xs px-2 py-0.5 rounded-full <?= $page === $item[0] ? 'bg-blue-500/20 text-blue-400' : 'bg-dark-600 text-gray-500' ?>"><?= $item[2] ?></span><?php endif; ?>
-            </a>
-            <?php endforeach; ?>
-        </nav>
-        <div class="p-4 mx-3 mb-3 rounded-xl bg-dark-900/50 border border-blue-500/10 text-xs">
-            <div class="flex justify-between mb-1"><span class="text-gray-500">Server</span><span class="text-green-400">● Online</span></div>
-            <div class="text-gray-500"><?= $serverIP ?></div>
-        </div>
-        <div class="p-3 border-t border-blue-500/10">
-            <a href="?page=logout" class="flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium text-red-400 hover:bg-red-500/10">🚪 Logout</a>
-        </div>
-    </aside>
-
-    <main class="flex-1 min-h-screen overflow-y-auto p-4 md:p-6 lg:p-8">
-
-<?php
-// ============================================================
-//  DASHBOARD PAGE
-// ============================================================
-if ($page === 'dashboard'): ?>
-        <div class="fade-in space-y-6">
-            <h1 class="text-2xl font-bold text-white">📊 Dashboard Overview</h1>
-
-            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                <div class="stat-card rounded-2xl p-5">
-                    <p class="text-gray-400 text-sm">Total Users</p>
-                    <p class="text-3xl font-bold text-white mt-1"><?= $stats['total_users'] ?></p>
-                </div>
-                <div class="stat-card rounded-2xl p-5">
-                    <p class="text-gray-400 text-sm">Online Now</p>
-                    <p class="text-3xl font-bold text-green-400 mt-1"><?= $stats['online_users'] ?></p>
-                    <p class="text-xs text-gray-400 mt-1"><?= $stats['active_connections'] ?> connections</p>
-                </div>
-                <div class="stat-card rounded-2xl p-5">
-                    <p class="text-gray-400 text-sm">Total Data</p>
-                    <p class="text-3xl font-bold text-cyan-400 mt-1"><?= formatDataSize($stats['total_data_used']) ?></p>
-                </div>
-                <div class="stat-card rounded-2xl p-5">
-                    <p class="text-gray-400 text-sm">Expired/Paused</p>
-                    <p class="text-3xl font-bold text-red-400 mt-1"><?= $stats['expired_users'] ?>/<?= $stats['paused_users'] ?></p>
-                </div>
-            </div>
-
-            <div class="glass glow rounded-2xl p-5">
-                <h3 class="text-lg font-semibold text-white mb-4">📈 Top Data Usage</h3>
-                <?php $topUsers = getTopDataUsers(); $maxData = $topUsers ? max(array_column($topUsers, 'data_used')) : 0; ?>
-                <?php if (empty($topUsers)): ?>
-                <p class="text-gray-500 text-center py-8">No data yet</p>
-                <?php else: ?>
-                <div class="space-y-3">
-                    <?php foreach ($topUsers as $tu): $pct = $maxData > 0 ? ($tu['data_used'] / $maxData) * 100 : 0; ?>
-                    <div class="flex items-center gap-4">
-                        <span class="w-28 text-sm text-gray-300 truncate"><?= htmlspecialchars($tu['username']) ?></span>
-                        <div class="flex-1 progress-bar"><div class="progress-fill bg-blue-500" style="width:<?= $pct ?>%"></div></div>
-                        <span class="text-sm text-cyan-400 w-20 text-right"><?= formatDataSize($tu['data_used']) ?></span>
-                    </div>
-                    <?php endforeach; ?>
-                </div>
-                <?php endif; ?>
-            </div>
-
-            <div class="glass glow rounded-2xl p-5">
-                <h3 class="text-lg font-semibold text-white mb-4">🟢 Online Users <span class="badge badge-online ml-2"><?= count($onlineUsers) ?></span></h3>
-                <?php if (empty($onlineUsers)): ?>
-                <p class="text-gray-500 text-center py-8">No users online</p>
-                <?php else: ?>
-                <div class="overflow-x-auto">
-                    <table class="w-full text-sm">
-                        <thead><tr class="text-gray-400 text-left border-b border-blue-500/10"><th class="pb-3 px-3">User</th><th class="pb-3 px-3">Conn</th><th class="pb-3 px-3">IPs</th><th class="pb-3 px-3">Data</th></tr></thead>
-                        <tbody>
-                        <?php foreach ($onlineUsers as $ou): ?>
-                        <tr class="table-row">
-                            <td class="py-3 px-3 font-medium text-white"><?= htmlspecialchars($ou['username']) ?></td>
-                            <td class="py-3 px-3"><span class="text-cyan-400"><?= $ou['current_connections'] ?></span>/<span class="text-gray-500"><?= $ou['max_connections'] ?></span></td>
-                            <td class="py-3 px-3"><?php foreach(array_filter(explode(',', $ou['connected_ips'] ?? '')) as $ip): ?><span class="text-xs bg-dark-600 px-2 py-0.5 rounded text-gray-300 mr-1"><?= htmlspecialchars(trim($ip)) ?></span><?php endforeach; ?></td>
-                            <td class="py-3 px-3 text-cyan-400"><?= formatDataSize($ou['data_used']) ?></td>
-                        </tr>
-                        <?php endforeach; ?>
-                        </tbody>
-                    </table>
-                </div>
-                <?php endif; ?>
-            </div>
-        </div>
-
-<?php
-// ============================================================
-//  USERS PAGE
-// ============================================================
-elseif ($page === 'users'):
-    $search = $_GET['search'] ?? '';
-    $filteredUsers = $search ? array_filter($users, fn($u) => stripos($u['username'], $search) !== false) : $users;
-?>
-        <div class="fade-in space-y-5">
-            <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-                <h1 class="text-2xl font-bold text-white">👥 User Management <span class="text-sm font-normal text-gray-400">(<?= count($users) ?>)</span></h1>
-                <button onclick="document.getElementById('create-modal').classList.remove('hidden')" class="btn-primary px-5 py-2.5 rounded-lg text-white font-semibold">➕ Create User</button>
-            </div>
-
-            <form method="GET" class="relative">
-                <input type="hidden" name="page" value="users">
-                <input type="text" name="search" value="<?= htmlspecialchars($search) ?>" placeholder="🔍 Search users..." class="input-field w-full rounded-lg px-4 py-3 text-white">
-            </form>
-
-            <div class="glass glow rounded-2xl overflow-hidden">
-                <div class="overflow-x-auto">
-                    <table class="w-full text-sm">
-                        <thead><tr class="text-gray-400 text-left border-b border-blue-500/10 bg-dark-800/50">
-                            <th class="py-3 px-4">User</th><th class="py-3 px-4">Password</th><th class="py-3 px-4">Status</th><th class="py-3 px-4">Expires</th><th class="py-3 px-4">Conn</th><th class="py-3 px-4">Data</th><th class="py-3 px-4">BW</th><th class="py-3 px-4 text-right">Actions</th>
-                        </tr></thead>
-                        <tbody>
-                        <?php foreach ($filteredUsers as $u):
-                            $dl = getDaysLeft($u['expires_at']);
-                            $exp = $dl <= 0;
-                            $dp = $u['data_limit'] > 0 ? min(($u['data_used'] / $u['data_limit']) * 100, 100) : 0;
-                            $overLimit = $u['data_limit'] > 0 && $u['data_used'] >= $u['data_limit'];
-                        ?>
-                        <tr class="table-row">
-                            <td class="py-3 px-4 font-medium text-white"><?= htmlspecialchars($u['username']) ?></td>
-                            <td class="py-3 px-4">
-                                <div class="flex items-center gap-2">
-                                    <span class="font-mono text-xs text-gray-400" id="pass-<?= $u['id'] ?>" data-pass="<?= htmlspecialchars($u['password']) ?>">••••••••</span>
-                                    <button onclick="togglePass(<?= $u['id'] ?>)" class="text-gray-500 hover:text-white text-xs">👁</button>
-                                    <button onclick="copyPass(<?= $u['id'] ?>)" class="text-gray-500 hover:text-blue-400 text-xs">📋</button>
-                                </div>
-                            </td>
-                            <td class="py-3 px-4">
-                                <?php if ($u['is_online']): ?><span class="badge badge-online"><span class="pulse-dot inline-block w-1.5 h-1.5 rounded-full bg-green-400 mr-1"></span>Online</span>
-                                <?php elseif ($exp): ?><span class="badge badge-expired">Expired</span>
-                                <?php elseif (!$u['is_enabled']): ?><span class="badge badge-paused">Paused<?= $overLimit ? ' (Data)' : '' ?></span>
-                                <?php else: ?><span class="badge badge-offline">Offline</span><?php endif; ?>
-                            </td>
-                            <td class="py-3 px-4 <?= $exp ? 'text-red-400' : ($dl <= 3 ? 'text-yellow-400' : 'text-gray-300') ?>"><?= $exp ? 'Exp '.abs($dl).'d' : $dl.'d' ?></td>
-                            <td class="py-3 px-4"><span class="text-cyan-400"><?= $u['current_connections'] ?></span>/<span class="text-gray-500"><?= $u['max_connections'] ?></span></td>
-                            <td class="py-3 px-4">
-                                <div class="space-y-1">
-                                    <span class="text-xs <?= $overLimit ? 'text-red-400' : 'text-gray-300' ?>"><?= formatDataSize($u['data_used']) ?></span>
-                                    <span class="text-xs text-gray-500">/ <?= $u['data_limit'] > 0 ? formatDataSize($u['data_limit']) : '∞' ?></span>
-                                    <?php if ($u['data_limit'] > 0): ?><div class="progress-bar w-20"><div class="progress-fill" style="width:<?= $dp ?>%;background:<?= $dp > 90 ? '#ef4444' : ($dp > 70 ? '#f59e0b' : '#3b82f6') ?>"></div></div><?php endif; ?>
-                                </div>
-                            </td>
-                            <td class="py-3 px-4 text-gray-400 text-xs"><?= $u['bandwidth_limit'] > 0 ? $u['bandwidth_limit'].'K' : '∞' ?></td>
-                            <td class="py-3 px-4">
-                                <div class="flex items-center justify-end gap-1">
-                                    <button onclick="showQR(<?= $u['id'] ?>, '<?= htmlspecialchars(addslashes($u['username'])) ?>')" class="p-1.5 rounded hover:bg-purple-500/20 text-purple-400" title="QR">📱</button>
-                                    <button onclick='showEdit(<?= json_encode($u) ?>)' class="p-1.5 rounded hover:bg-blue-500/20 text-blue-400" title="Edit">✏️</button>
-                                    <form method="POST" class="inline"><input type="hidden" name="action" value="toggle_user"><input type="hidden" name="id" value="<?= $u['id'] ?>">
-                                        <button type="submit" class="p-1.5 rounded <?= $u['is_enabled'] ? 'hover:bg-yellow-500/20 text-yellow-400' : 'hover:bg-green-500/20 text-green-400' ?>" title="<?= $u['is_enabled'] ? 'Pause' : 'Unpause' ?>">⚡</button>
-                                    </form>
-                                    <form method="POST" class="inline" onsubmit="return confirm('Delete user and remove from system?')"><input type="hidden" name="action" value="delete_user"><input type="hidden" name="id" value="<?= $u['id'] ?>">
-                                        <button type="submit" class="p-1.5 rounded hover:bg-red-500/20 text-red-400" title="Delete">🗑️</button>
-                                    </form>
-                                </div>
-                            </td>
-                        </tr>
-                        <?php endforeach; ?>
-                        </tbody>
-                    </table>
-                </div>
-                <?php if (empty($filteredUsers)): ?><div class="text-center py-12 text-gray-500">No users</div><?php endif; ?>
-            </div>
-        </div>
-
-        <!-- Create User Modal -->
-        <div id="create-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 modal-bg" onclick="this.classList.add('hidden')">
-            <div class="glass glow rounded-2xl p-6 w-full max-w-lg fade-in" onclick="event.stopPropagation()">
-                <div class="flex items-center justify-between mb-5">
-                    <h2 class="text-xl font-bold text-white">➕ Create New User</h2>
-                    <button onclick="document.getElementById('create-modal').classList.add('hidden')" class="text-gray-400 hover:text-white text-xl">✕</button>
-                </div>
-                <form method="POST" class="space-y-4">
-                    <input type="hidden" name="action" value="create_user">
-                    <div><label class="block text-sm text-gray-400 mb-1">Username</label><input type="text" name="username" id="create-username" class="input-field w-full rounded-lg px-4 py-3 text-white" placeholder="username" required pattern="[a-zA-Z][a-zA-Z0-9_]{2,31}"></div>
-                    <div><label class="block text-sm text-gray-400 mb-1">Password (leave blank for random)</label>
-                        <div class="flex gap-2"><input type="text" name="password" id="create-password" class="input-field w-full rounded-lg px-4 py-3 text-white" placeholder="Auto-generate if empty">
-                        <button type="button" onclick="document.getElementById('create-password').value=generatePass()" class="btn-primary px-4 rounded-lg text-white text-sm whitespace-nowrap">🔄</button></div>
-                    </div>
-                    <div class="grid grid-cols-2 gap-4">
-                        <div><label class="block text-sm text-gray-400 mb-1">Days</label><input type="number" name="days" id="create-days" value="30" class="input-field w-full rounded-lg px-4 py-3 text-white" min="1"></div>
-                        <div><label class="block text-sm text-gray-400 mb-1">Max Connections</label><input type="number" name="max_connections" id="create-maxconn" value="1" class="input-field w-full rounded-lg px-4 py-3 text-white" min="1" max="10"></div>
-                    </div>
-                    <div class="grid grid-cols-2 gap-4">
-                        <div>
-                            <label class="block text-sm text-gray-400 mb-1">Data Limit (MB, 0=∞)</label>
-                            <input type="number" name="data_limit" id="create-data" value="0" class="input-field w-full rounded-lg px-4 py-3 text-white" min="0">
-                            <div class="flex flex-wrap gap-1 mt-2">
-                                <span onclick="document.getElementById('create-data').value=0" class="preset-btn text-xs px-2 py-1 rounded bg-dark-600 text-gray-400 cursor-pointer">∞</span>
-                                <span onclick="document.getElementById('create-data').value=1024" class="preset-btn text-xs px-2 py-1 rounded bg-dark-600 text-gray-400 cursor-pointer">1GB</span>
-                                <span onclick="document.getElementById('create-data').value=5120" class="preset-btn text-xs px-2 py-1 rounded bg-dark-600 text-gray-400 cursor-pointer">5GB</span>
-                                <span onclick="document.getElementById('create-data').value=10240" class="preset-btn text-xs px-2 py-1 rounded bg-dark-600 text-gray-400 cursor-pointer">10GB</span>
-                                <span onclick="document.getElementById('create-data').value=51200" class="preset-btn text-xs px-2 py-1 rounded bg-dark-600 text-gray-400 cursor-pointer">50GB</span>
-                            </div>
-                        </div>
-                        <div>
-                            <label class="block text-sm text-gray-400 mb-1">Bandwidth (Kbps, 0=∞)</label>
-                            <input type="number" name="bandwidth_limit" id="create-bw" value="0" class="input-field w-full rounded-lg px-4 py-3 text-white" min="0">
-                            <div class="flex flex-wrap gap-1 mt-2">
-                                <span onclick="document.getElementById('create-bw').value=0" class="preset-btn text-xs px-2 py-1 rounded bg-dark-600 text-gray-400 cursor-pointer">∞</span>
-                                <span onclick="document.getElementById('create-bw').value=512" class="preset-btn text-xs px-2 py-1 rounded bg-dark-600 text-gray-400 cursor-pointer">512K</span>
-                                <span onclick="document.getElementById('create-bw').value=1024" class="preset-btn text-xs px-2 py-1 rounded bg-dark-600 text-gray-400 cursor-pointer">1M</span>
-                                <span onclick="document.getElementById('create-bw').value=2048" class="preset-btn text-xs px-2 py-1 rounded bg-dark-600 text-gray-400 cursor-pointer">2M</span>
-                                <span onclick="document.getElementById('create-bw').value=4096" class="preset-btn text-xs px-2 py-1 rounded bg-dark-600 text-gray-400 cursor-pointer">4M</span>
-                            </div>
-                        </div>
-                    </div>
-                    <button type="submit" class="btn-primary w-full py-3 rounded-lg text-white font-semibold text-base">Create User</button>
-                </form>
-            </div>
-        </div>
-
-        <!-- Edit User Modal -->
-        <div id="edit-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 modal-bg" onclick="this.classList.add('hidden')">
-            <div class="glass glow rounded-2xl p-6 w-full max-w-lg fade-in" onclick="event.stopPropagation()">
-                <div class="flex items-center justify-between mb-5">
-                    <h2 class="text-xl font-bold text-white">✏️ Edit: <span id="edit-title"></span></h2>
-                    <button onclick="document.getElementById('edit-modal').classList.add('hidden')" class="text-gray-400 hover:text-white text-xl">✕</button>
-                </div>
-                <form method="POST" class="space-y-4">
-                    <input type="hidden" name="action" value="update_user">
-                    <input type="hidden" name="id" id="edit-id">
-                    <div><label class="block text-sm text-gray-400 mb-1">New Password (blank = keep)</label>
-                        <div class="flex gap-2"><input type="text" name="password" id="edit-pass" class="input-field w-full rounded-lg px-4 py-3 text-white" placeholder="New password">
-                        <button type="button" onclick="document.getElementById('edit-pass').value=generatePass()" class="btn-primary px-4 rounded-lg text-white text-sm">🔄</button></div>
-                    </div>
-                    <div class="grid grid-cols-2 gap-4">
-                        <div><label class="block text-sm text-gray-400 mb-1">Days (from now)</label><input type="number" name="days" id="edit-days" class="input-field w-full rounded-lg px-4 py-3 text-white" min="1"></div>
-                        <div><label class="block text-sm text-gray-400 mb-1">Max Connections</label><input type="number" name="max_connections" id="edit-maxconn" class="input-field w-full rounded-lg px-4 py-3 text-white" min="1" max="10"></div>
-                    </div>
-                    <div class="grid grid-cols-2 gap-4">
-                        <div>
-                            <label class="block text-sm text-gray-400 mb-1">Data Limit (MB)</label>
-                            <input type="number" name="data_limit" id="edit-data" class="input-field w-full rounded-lg px-4 py-3 text-white" min="0">
-                            <div class="flex flex-wrap gap-1 mt-2">
-                                <span onclick="document.getElementById('edit-data').value=0" class="preset-btn text-xs px-2 py-1 rounded bg-dark-600 text-gray-400 cursor-pointer">∞</span>
-                                <span onclick="document.getElementById('edit-data').value=1024" class="preset-btn text-xs px-2 py-1 rounded bg-dark-600 text-gray-400 cursor-pointer">1GB</span>
-                                <span onclick="document.getElementById('edit-data').value=5120" class="preset-btn text-xs px-2 py-1 rounded bg-dark-600 text-gray-400 cursor-pointer">5GB</span>
-                                <span onclick="document.getElementById('edit-data').value=10240" class="preset-btn text-xs px-2 py-1 rounded bg-dark-600 text-gray-400 cursor-pointer">10GB</span>
-                                <span onclick="document.getElementById('edit-data').value=51200" class="preset-btn text-xs px-2 py-1 rounded bg-dark-600 text-gray-400 cursor-pointer">50GB</span>
-                            </div>
-                        </div>
-                        <div>
-                            <label class="block text-sm text-gray-400 mb-1">Bandwidth (Kbps)</label>
-                            <input type="number" name="bandwidth_limit" id="edit-bw" class="input-field w-full rounded-lg px-4 py-3 text-white" min="0">
-                            <div class="flex flex-wrap gap-1 mt-2">
-                                <span onclick="document.getElementById('edit-bw').value=0" class="preset-btn text-xs px-2 py-1 rounded bg-dark-600 text-gray-400 cursor-pointer">∞</span>
-                                <span onclick="document.getElementById('edit-bw').value=512" class="preset-btn text-xs px-2 py-1 rounded bg-dark-600 text-gray-400 cursor-pointer">512K</span>
-                                <span onclick="document.getElementById('edit-bw').value=1024" class="preset-btn text-xs px-2 py-1 rounded bg-dark-600 text-gray-400 cursor-pointer">1M</span>
-                                <span onclick="document.getElementById('edit-bw').value=2048" class="preset-btn text-xs px-2 py-1 rounded bg-dark-600 text-gray-400 cursor-pointer">2M</span>
-                                <span onclick="document.getElementById('edit-bw').value=4096" class="preset-btn text-xs px-2 py-1 rounded bg-dark-600 text-gray-400 cursor-pointer">4M</span>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="flex gap-2">
-                        <button type="submit" class="btn-primary flex-1 py-3 rounded-lg text-white font-semibold">Save</button>
-                    </div>
-                </form>
-                <form method="POST" class="mt-2">
-                    <input type="hidden" name="action" value="reset_data">
-                    <input type="hidden" name="id" id="edit-reset-id">
-                    <button type="submit" class="btn-warning w-full py-2 rounded-lg text-white text-sm">Reset Data Usage to 0</button>
-                </form>
-            </div>
-        </div>
-
-        <!-- QR Modal -->
-        <div id="qr-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 modal-bg" onclick="this.classList.add('hidden')">
-            <div class="glass glow rounded-2xl p-6 w-full max-w-3xl max-h-[90vh] overflow-y-auto fade-in" onclick="event.stopPropagation()">
-                <div class="flex items-center justify-between mb-5">
-                    <h2 class="text-xl font-bold text-white">📱 QR Codes: <span id="qr-title"></span></h2>
-                    <button onclick="document.getElementById('qr-modal').classList.add('hidden')" class="text-gray-400 hover:text-white text-xl">✕</button>
-                </div>
-                <div id="qr-content" class="grid grid-cols-1 sm:grid-cols-2 gap-4"></div>
-            </div>
-        </div>
-
-<?php
-// ============================================================
-//  ONLINE USERS PAGE
-// ============================================================
-elseif ($page === 'online'):
-    $totalConn = array_sum(array_column($onlineUsers, 'current_connections'));
-?>
-        <div class="fade-in space-y-5">
-            <h1 class="text-2xl font-bold text-white">🟢 Online Users <span class="badge badge-online ml-2"><?= count($onlineUsers) ?></span></h1>
-
-            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                <div class="stat-card rounded-2xl p-4"><p class="text-gray-400 text-sm">Online</p><p class="text-2xl font-bold text-green-400 mt-1"><?= count($onlineUsers) ?></p></div>
-                <div class="stat-card rounded-2xl p-4"><p class="text-gray-400 text-sm">Connections</p><p class="text-2xl font-bold text-cyan-400 mt-1"><?= $totalConn ?></p></div>
-                <div class="stat-card rounded-2xl p-4"><p class="text-gray-400 text-sm">Data</p><p class="text-2xl font-bold text-purple-400 mt-1"><?= formatDataSize(array_sum(array_column($onlineUsers, 'data_used'))) ?></p></div>
-            </div>
-
-            <?php if (empty($onlineUsers)): ?>
-            <div class="glass glow rounded-2xl p-12 text-center text-gray-500">No users online</div>
-            <?php else: ?>
-            <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-                <?php foreach ($onlineUsers as $ou): $dl = getDaysLeft($ou['expires_at']); $dp = $ou['data_limit'] > 0 ? min(($ou['data_used'] / $ou['data_limit']) * 100, 100) : 0; ?>
-                <div class="glass glow rounded-xl p-4">
-                    <div class="flex items-center justify-between mb-3">
-                        <div class="flex items-center gap-2">
-                            <span class="pulse-dot inline-block w-2.5 h-2.5 rounded-full bg-green-400"></span>
-                            <h3 class="font-semibold text-white"><?= htmlspecialchars($ou['username']) ?></h3>
-                        </div>
-                        <form method="POST"><input type="hidden" name="action" value="kick_user"><input type="hidden" name="id" value="<?= $ou['id'] ?>">
-                            <button type="submit" class="p-1.5 rounded hover:bg-red-500/20 text-red-400" title="Kick">⚡</button>
-                        </form>
-                    </div>
-                    <div class="space-y-2 text-sm">
-                        <div class="flex justify-between"><span class="text-gray-400">Connections</span><span class="text-cyan-400"><?= $ou['current_connections'] ?>/<?= $ou['max_connections'] ?></span></div>
-                        <div class="flex justify-between"><span class="text-gray-400">Time Left</span><span class="<?= $dl <= 3 ? 'text-yellow-400' : 'text-gray-300' ?>"><?= $dl ?>d</span></div>
-                        <div class="flex justify-between"><span class="text-gray-400">Data</span><span class="text-gray-300"><?= formatDataSize($ou['data_used']) ?><?= $ou['data_limit'] > 0 ? '/'.formatDataSize($ou['data_limit']) : '' ?></span></div>
-                        <?php if ($ou['data_limit'] > 0): ?><div class="progress-bar"><div class="progress-fill" style="width:<?= $dp ?>%;background:<?= $dp > 90 ? '#ef4444' : ($dp > 70 ? '#f59e0b' : '#3b82f6') ?>"></div></div><?php endif; ?>
-                    </div>
-                    <?php $ips = array_filter(explode(',', $ou['connected_ips'] ?? '')); if (!empty($ips)): ?>
-                    <div class="mt-3 pt-3 border-t border-gray-700/30">
-                        <p class="text-xs text-gray-500 mb-1">IPs</p>
-                        <div class="flex flex-wrap gap-1"><?php foreach($ips as $ip): ?><span class="text-xs bg-dark-600 px-2 py-0.5 rounded text-gray-400 font-mono"><?= htmlspecialchars(trim($ip)) ?></span><?php endforeach; ?></div>
-                    </div>
-                    <?php endif; ?>
-                </div>
-                <?php endforeach; ?>
-            </div>
-            <?php endif; ?>
-        </div>
-
-<?php
-// ============================================================
-//  SETTINGS PAGE
-// ============================================================
-elseif ($page === 'settings'): ?>
-        <div class="fade-in space-y-6 max-w-4xl">
-            <h1 class="text-2xl font-bold text-white">⚙️ Settings</h1>
-
-            <form method="POST">
-                <input type="hidden" name="action" value="save_settings">
-
-                <div class="glass glow rounded-2xl p-6 mb-6">
-                    <h3 class="text-lg font-semibold text-white mb-4">🌐 SSH Configuration</h3>
-                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        <div><label class="block text-sm text-gray-400 mb-1">SSH Port</label><input type="number" name="ssh_port" value="<?= htmlspecialchars($settings['ssh_port'] ?? '22') ?>" class="input-field w-full rounded-lg px-4 py-3 text-white"><p class="text-xs text-gray-500 mt-1">Requires SSH restart (root only)</p></div>
-                        <div><label class="block text-sm text-gray-400 mb-1">Server IP</label><input type="text" name="server_ip" value="<?= htmlspecialchars($settings['server_ip'] ?? '') ?>" class="input-field w-full rounded-lg px-4 py-3 text-white" placeholder="<?= $serverIP ?>"></div>
-                    </div>
-                </div>
-
-                <div class="glass glow rounded-2xl p-6 mb-6">
-                    <h3 class="text-lg font-semibold text-white mb-4">🔑 Admin</h3>
-                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        <div><label class="block text-sm text-gray-400 mb-1">Username</label><input type="text" name="admin_username" value="<?= htmlspecialchars($settings['admin_username'] ?? 'admin') ?>" class="input-field w-full rounded-lg px-4 py-3 text-white"></div>
-                        <div><label class="block text-sm text-gray-400 mb-1">New Password</label><input type="password" name="admin_password_new" class="input-field w-full rounded-lg px-4 py-3 text-white" placeholder="Leave blank to keep"></div>
-                    </div>
-                </div>
-
-                <div class="glass glow rounded-2xl p-6 mb-6">
-                    <h3 class="text-lg font-semibold text-white mb-4">🤖 Telegram</h3>
-                    <div class="space-y-4">
-                        <div><label class="block text-sm text-gray-400 mb-1">Bot Token</label><input type="text" name="telegram_bot_token" value="<?= htmlspecialchars($settings['telegram_bot_token'] ?? '') ?>" class="input-field w-full rounded-lg px-4 py-3 text-white font-mono text-sm" placeholder="123456789:ABC..."></div>
-                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                            <div><label class="block text-sm text-gray-400 mb-1">Auto Backup</label>
-                                <select name="telegram_backup_enabled" class="input-field w-full rounded-lg px-4 py-3 text-white">
-                                    <option value="0" <?= ($settings['telegram_backup_enabled'] ?? '0') === '0' ? 'selected' : '' ?>>Disabled</option>
-                                    <option value="1" <?= ($settings['telegram_backup_enabled'] ?? '0') === '1' ? 'selected' : '' ?>>Enabled</option>
-                                </select>
-                            </div>
-                            <div><label class="block text-sm text-gray-400 mb-1">Interval (hours)</label><input type="number" name="telegram_backup_interval" value="<?= htmlspecialchars($settings['telegram_backup_interval'] ?? '24') ?>" class="input-field w-full rounded-lg px-4 py-3 text-white" min="1"></div>
-                        </div>
-                    </div>
-                </div>
-
-                <button type="submit" class="btn-primary px-8 py-3 rounded-xl text-white font-semibold">💾 Save Settings</button>
-            </form>
-
-            <div class="glass glow rounded-2xl p-6">
-                <h3 class="text-lg font-semibold text-white mb-4">💬 Chat IDs</h3>
-                <form method="POST" class="flex gap-2 mb-3">
-                    <input type="hidden" name="action" value="add_chat_id">
-                    <input type="text" name="chat_id" class="input-field flex-1 rounded-lg px-4 py-3 text-white" placeholder="Chat ID" required>
-                    <button type="submit" class="btn-primary px-4 rounded-lg text-white font-semibold">+ Add</button>
-                </form>
-                <div class="flex flex-wrap gap-2 mb-4">
-                    <?php foreach ($chatIds as $cid): ?>
-                    <div class="flex items-center gap-1 bg-dark-600 px-3 py-1 rounded-full text-sm">
-                        <span class="text-gray-300"><?= htmlspecialchars($cid) ?></span>
-                        <form method="POST" class="inline"><input type="hidden" name="action" value="remove_chat_id"><input type="hidden" name="chat_id" value="<?= htmlspecialchars($cid) ?>"><button type="submit" class="text-gray-500 hover:text-red-400 ml-1">✕</button></form>
-                    </div>
-                    <?php endforeach; ?>
-                </div>
-                <form method="POST" class="inline"><input type="hidden" name="action" value="test_telegram"><button type="submit" class="btn-primary px-4 py-2 rounded-lg text-white text-sm">📤 Test</button></form>
-            </div>
-
-            <div class="glass glow rounded-2xl p-6">
-                <h3 class="text-lg font-semibold text-white mb-4">💾 Backup</h3>
-                <div class="flex flex-wrap gap-3 mb-4">
-                    <form method="POST"><input type="hidden" name="action" value="create_backup"><button type="submit" class="btn-success px-4 py-2 rounded-lg text-white text-sm font-semibold">⬇️ Download SQL</button></form>
-                    <form method="POST"><input type="hidden" name="action" value="telegram_backup"><button type="submit" class="btn-primary px-4 py-2 rounded-lg text-white text-sm font-semibold">📤 Send to TG</button></form>
-                </div>
-                <form method="POST" enctype="multipart/form-data" class="flex items-center gap-3">
-                    <input type="hidden" name="action" value="restore_backup">
-                    <input type="file" name="backup_file" accept=".sql" class="text-sm text-gray-400 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:bg-dark-600 file:text-gray-300">
-                    <button type="submit" class="btn-warning px-4 py-2 rounded-lg text-white text-sm font-semibold">⬆️ Restore</button>
-                </form>
-            </div>
-        </div>
-
-<?php endif; ?>
-
-    </main>
+<aside class="hidden md:flex w-56 flex-col border-r border-blue-500/10" style="background:linear-gradient(180deg,#111827,#0d1321)">
+<div class="p-4 border-b border-blue-500/10 flex items-center gap-3"><div class="w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-lg">🖥️</div><div><p class="text-sm font-bold text-white">SSH Panel</p><p class="text-[10px] text-gray-500">v<?=VERSION?></p></div></div>
+<nav class="flex-1 py-3 px-2 space-y-0.5">
+<?php foreach([['dashboard','📊 Dashboard',count($users)],['users','👥 Users',count($users)],['online','🟢 Online',count($onlineUsers)],['settings','⚙️ Settings',null]] as $n):?>
+<a href="?page=<?=$n[0]?>" class="si <?=$page===$n[0]?'a':''?> flex items-center justify-between px-3 py-2.5 rounded-lg text-sm font-medium text-gray-400 hover:text-white">
+<span><?=$n[1]?></span><?php if($n[2]!==null):?><span class="text-[10px] px-1.5 py-0.5 rounded-full bg-gray-700/60 text-gray-500"><?=$n[2]?></span><?php endif;?>
+</a><?php endforeach;?>
+</nav>
+<div class="p-3 border-t border-blue-500/10"><a href="?page=logout" class="flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm text-red-400 hover:bg-red-500/10">🚪 Logout</a></div>
+</aside>
+<div class="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-[#111827] border-t border-blue-500/10 flex">
+<?php foreach([['dashboard','📊'],['users','👥'],['online','🟢'],['settings','⚙️'],['logout','🚪']] as $n):?>
+<a href="?page=<?=$n[0]?>" class="flex-1 py-3 text-center text-xs <?=$page===$n[0]?'text-blue-400':'text-gray-500'?>"><?=$n[1]?></a>
+<?php endforeach;?>
 </div>
-<?php endif; ?>
+<main class="flex-1 p-4 md:p-6 overflow-y-auto pb-20 md:pb-6">
 
+<?php if($page==='dashboard'):?>
+<div class="space-y-5"><h1 class="text-xl font-bold text-white">📊 Dashboard</h1>
+<div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
+<div class="card rounded-2xl p-5"><p class="text-gray-400 text-xs">Users</p><p class="text-3xl font-bold text-white mt-1"><?=count($users)?></p></div>
+<div class="card rounded-2xl p-5"><p class="text-gray-400 text-xs">Online</p><p class="text-3xl font-bold text-green-400 mt-1"><?=count($onlineUsers)?></p></div>
+<div class="card rounded-2xl p-5"><p class="text-gray-400 text-xs">Data</p><p class="text-3xl font-bold text-cyan-400 mt-1"><?=fmtData($totalData)?></p></div>
+<div class="card rounded-2xl p-5"><p class="text-gray-400 text-xs">Exp/Paused</p><p class="text-3xl font-bold text-red-400 mt-1"><?=$expiredCount?>/<?=$pausedCount?></p></div>
+</div>
+<div class="card rounded-2xl p-5"><h3 class="text-base font-semibold text-white mb-3">🟢 Online (<?=count($onlineUsers)?>)</h3>
+<?php if(empty($onlineUsers)):?><p class="text-gray-500 text-center py-6 text-sm">Nobody online</p>
+<?php else:?><div class="space-y-2"><?php foreach($onlineUsers as $u):?>
+<div class="flex items-center justify-between bg-[#0a0e17]/50 rounded-lg px-4 py-2.5"><div class="flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-green-400 pulse"></span><span class="text-white text-sm font-medium"><?=htmlspecialchars($u['username'])?></span></div>
+<div class="flex items-center gap-3 text-xs"><span class="text-cyan-400"><?=$u['cur_conn']?>/<?=$u['max_conn']?></span><span class="text-gray-400"><?=fmtData($u['data_used'])?></span>
+<?php foreach(array_filter(explode(',',$u['ips'])) as $ip):?><span class="bg-gray-700/60 px-1.5 py-0.5 rounded text-gray-300"><?=htmlspecialchars($ip)?></span><?php endforeach;?></div></div>
+<?php endforeach;?></div><?php endif;?></div></div>
+
+<?php elseif($page==='users'):?>
+<div class="space-y-4">
+<div class="flex items-center justify-between"><h1 class="text-xl font-bold text-white">👥 Users (<?=count($users)?>)</h1>
+<button onclick="document.getElementById('cm').classList.remove('hidden')" class="btn px-4 py-2 text-sm">➕ Create</button></div>
+<div class="card rounded-2xl overflow-hidden"><div class="overflow-x-auto">
+<table class="w-full text-sm"><thead><tr class="text-gray-400 text-left border-b border-blue-500/10 bg-[#0a0e17]/30 text-xs">
+<th class="py-2.5 px-3">User</th><th class="py-2.5 px-3">Pass</th><th class="py-2.5 px-3">Status</th><th class="py-2.5 px-3">Exp</th><th class="py-2.5 px-3">Conn</th><th class="py-2.5 px-3">Data</th><th class="py-2.5 px-3">BW</th><th class="py-2.5 px-3 text-right">Act</th>
+</tr></thead><tbody>
+<?php foreach($users as $u): $dl=daysLeft($u['expires_at']); $exp=$dl<=0; $dp=$u['data_limit']>0?min(($u['data_used']/$u['data_limit'])*100,100):0; ?>
+<tr class="border-b border-blue-500/5 hover:bg-blue-500/5">
+<td class="py-2.5 px-3 text-white font-medium"><?=htmlspecialchars($u['username'])?></td>
+<td class="py-2.5 px-3"><div class="flex items-center gap-1.5"><span class="font-mono text-[11px] text-gray-400" id="p-<?=$u['id']?>" data-p="<?=htmlspecialchars($u['password'])?>">••••••</span><button onclick="tP(<?=$u['id']?>)" class="text-gray-500 hover:text-white text-[11px]">👁</button><button onclick="cP(<?=$u['id']?>)" class="text-gray-500 hover:text-blue-400 text-[11px]">📋</button></div></td>
+<td class="py-2.5 px-3"><?php if($u['is_online']):?><span class="bdg bg-green-500/20 text-green-400 border border-green-500/30">● On</span><?php elseif($exp):?><span class="bdg bg-red-500/20 text-red-400 border border-red-500/30">Exp</span><?php elseif(!$u['is_enabled']):?><span class="bdg bg-yellow-500/20 text-yellow-400 border border-yellow-500/30">Paused</span><?php else:?><span class="bdg bg-gray-500/20 text-gray-400 border border-gray-500/30">Off</span><?php endif;?></td>
+<td class="py-2.5 px-3 text-xs <?=$exp?'text-red-400':($dl<=3?'text-yellow-400':'text-gray-300')?>"><?=$exp?'-'.abs($dl).'d':$dl.'d'?></td>
+<td class="py-2.5 px-3 text-xs"><span class="text-cyan-400"><?=$u['cur_conn']?></span>/<span class="text-gray-500"><?=$u['max_conn']?></span></td>
+<td class="py-2.5 px-3"><span class="text-[11px] text-gray-300"><?=fmtData($u['data_used'])?></span><span class="text-[11px] text-gray-500">/<?=$u['data_limit']>0?fmtData($u['data_limit']):'∞'?></span>
+<?php if($u['data_limit']>0):?><div class="w-14 h-1 bg-blue-500/20 rounded-full mt-1"><div class="h-full rounded-full" style="width:<?=$dp?>%;background:<?=$dp>90?'#ef4444':($dp>70?'#f59e0b':'#3b82f6')?>"></div></div><?php endif;?></td>
+<td class="py-2.5 px-3 text-gray-400 text-[11px]"><?=$u['bw_limit']>0?$u['bw_limit'].'K':'∞'?></td>
+<td class="py-2.5 px-3"><div class="flex items-center justify-end gap-0.5">
+<button onclick="sQR(<?=$u['id']?>)" class="p-1.5 rounded hover:bg-purple-500/20 text-purple-400 text-xs">📱</button>
+<button onclick="sEd(<?=$u['id']?>)" class="p-1.5 rounded hover:bg-blue-500/20 text-blue-400 text-xs">✏️</button>
+<form method="POST" class="inline"><input type="hidden" name="action" value="toggle_user"><input type="hidden" name="id" value="<?=$u['id']?>"><button type="submit" class="p-1.5 rounded <?=$u['is_enabled']?'hover:bg-yellow-500/20 text-yellow-400':'hover:bg-green-500/20 text-green-400'?> text-xs">⚡</button></form>
+<form method="POST" class="inline" onsubmit="return confirm('Delete?')"><input type="hidden" name="action" value="delete_user"><input type="hidden" name="id" value="<?=$u['id']?>"><button type="submit" class="p-1.5 rounded hover:bg-red-500/20 text-red-400 text-xs">🗑️</button></form>
+</div></td></tr>
+<?php endforeach;?></tbody></table></div>
+<?php if(!$users):?><p class="text-center py-10 text-gray-500 text-sm">No users</p><?php endif;?></div></div>
+
+<!-- Create -->
+<div id="cm" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 mbg" onclick="this.classList.add('hidden')">
+<div class="card rounded-2xl p-6 w-full max-w-lg" onclick="event.stopPropagation()">
+<div class="flex items-center justify-between mb-4"><h2 class="text-lg font-bold text-white">➕ Create</h2><button onclick="document.getElementById('cm').classList.add('hidden')" class="text-gray-400 hover:text-white">✕</button></div>
+<form method="POST" class="space-y-3"><input type="hidden" name="action" value="create_user">
+<div><label class="block text-xs text-gray-400 mb-1">Username</label><input type="text" name="username" class="inp" required pattern="[a-zA-Z][a-zA-Z0-9_]{2,}"></div>
+<div><label class="block text-xs text-gray-400 mb-1">Password (blank=random)</label><div class="flex gap-2"><input type="text" name="password" id="np" class="inp"><button type="button" onclick="document.getElementById('np').value=rP()" class="btn px-3 py-2 text-sm">🔄</button></div></div>
+<div class="grid grid-cols-2 gap-3">
+<div><label class="block text-xs text-gray-400 mb-1">Days</label><input type="number" name="days" value="30" class="inp" min="1"></div>
+<div><label class="block text-xs text-gray-400 mb-1">Max Conn</label><input type="number" name="max_conn" value="1" class="inp" min="1" max="10"></div>
+</div>
+<div class="grid grid-cols-2 gap-3">
+<div><label class="block text-xs text-gray-400 mb-1">Data (MB)</label><input type="number" name="data_limit" id="nd" value="0" class="inp" min="0">
+<div class="flex flex-wrap gap-1 mt-1.5"><?php foreach([0=>'∞',1024=>'1G',5120=>'5G',10240=>'10G',51200=>'50G'] as $v=>$l):?><span onclick="document.getElementById('nd').value=<?=$v?>" class="pre text-[10px] px-2 py-1 rounded bg-gray-700/60 text-gray-400"><?=$l?></span><?php endforeach;?></div></div>
+<div><label class="block text-xs text-gray-400 mb-1">BW (Kbps)</label><input type="number" name="bw_limit" id="nb" value="0" class="inp" min="0">
+<div class="flex flex-wrap gap-1 mt-1.5"><?php foreach([0=>'∞',512=>'512K',1024=>'1M',2048=>'2M',4096=>'4M'] as $v=>$l):?><span onclick="document.getElementById('nb').value=<?=$v?>" class="pre text-[10px] px-2 py-1 rounded bg-gray-700/60 text-gray-400"><?=$l?></span><?php endforeach;?></div></div>
+</div>
+<button type="submit" class="btn w-full py-2.5">Create</button>
+</form></div></div>
+
+<!-- Edit -->
+<div id="em" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 mbg" onclick="this.classList.add('hidden')">
+<div class="card rounded-2xl p-6 w-full max-w-lg" onclick="event.stopPropagation()">
+<div class="flex items-center justify-between mb-4"><h2 class="text-lg font-bold text-white">✏️ <span id="en"></span></h2><button onclick="document.getElementById('em').classList.add('hidden')" class="text-gray-400 hover:text-white">✕</button></div>
+<form method="POST" class="space-y-3"><input type="hidden" name="action" value="update_user"><input type="hidden" name="id" id="ei">
+<div><label class="block text-xs text-gray-400 mb-1">Password (blank=keep)</label><div class="flex gap-2"><input type="text" name="password" id="ep" class="inp"><button type="button" onclick="document.getElementById('ep').value=rP()" class="btn px-3 py-2 text-sm">🔄</button></div></div>
+<div class="grid grid-cols-2 gap-3">
+<div><label class="block text-xs text-gray-400 mb-1">Days</label><input type="number" name="days" id="ed" class="inp" min="1"></div>
+<div><label class="block text-xs text-gray-400 mb-1">Max Conn</label><input type="number" name="max_conn" id="ec" class="inp" min="1" max="10"></div>
+</div>
+<div class="grid grid-cols-2 gap-3">
+<div><label class="block text-xs text-gray-400 mb-1">Data (MB)</label><input type="number" name="data_limit" id="edl" class="inp" min="0">
+<div class="flex flex-wrap gap-1 mt-1.5"><?php foreach([0=>'∞',1024=>'1G',5120=>'5G',10240=>'10G',51200=>'50G'] as $v=>$l):?><span onclick="document.getElementById('edl').value=<?=$v?>" class="pre text-[10px] px-2 py-1 rounded bg-gray-700/60 text-gray-400"><?=$l?></span><?php endforeach;?></div></div>
+<div><label class="block text-xs text-gray-400 mb-1">BW (Kbps)</label><input type="number" name="bw_limit" id="eb" class="inp" min="0">
+<div class="flex flex-wrap gap-1 mt-1.5"><?php foreach([0=>'∞',512=>'512K',1024=>'1M',2048=>'2M',4096=>'4M'] as $v=>$l):?><span onclick="document.getElementById('eb').value=<?=$v?>" class="pre text-[10px] px-2 py-1 rounded bg-gray-700/60 text-gray-400"><?=$l?></span><?php endforeach;?></div></div>
+</div>
+<div class="flex gap-2"><button type="submit" class="btn flex-1 py-2.5">Save</button><button type="submit" name="action" value="reset_data" class="btn-y px-4 py-2.5 text-white rounded-lg text-sm font-semibold">Reset Data</button></div>
+</form></div></div>
+
+<!-- QR -->
+<div id="qm" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 mbg" onclick="this.classList.add('hidden')">
+<div class="card rounded-2xl p-6 w-full max-w-2xl max-h-[90vh] overflow-y-auto" onclick="event.stopPropagation()">
+<div class="flex items-center justify-between mb-4"><h2 class="text-lg font-bold text-white">📱 <span id="qn"></span></h2><button onclick="document.getElementById('qm').classList.add('hidden')" class="text-gray-400 hover:text-white">✕</button></div>
+<div id="qc" class="grid grid-cols-1 sm:grid-cols-2 gap-3"></div>
+</div></div>
+
+<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
 <script>
-// Generate password
-function generatePass(len=12) {
-    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%&*';
-    let p = '';
-    for (let i = 0; i < len; i++) p += chars.charAt(Math.floor(Math.random() * chars.length));
-    return p;
+const UD=<?=json_encode(array_map(function($u){return['id'=>$u['id'],'username'=>$u['username'],'password'=>$u['password'],'expires_at'=>$u['expires_at'],'max_conn'=>$u['max_conn'],'data_limit'=>$u['data_limit'],'bw_limit'=>$u['bw_limit']];},array_values($users)))?>;
+const SIP=<?=json_encode($serverIP)?>,SPT=<?=json_encode($sshPort)?>;
+
+function rP(n=12){const c='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';let s='';for(let i=0;i<n;i++)s+=c[Math.floor(Math.random()*c.length)];return s}
+function tP(id){const e=document.getElementById('p-'+id);e.textContent=e.textContent==='••••••'?e.dataset.p:'••••••'}
+function cP(id){const e=document.getElementById('p-'+id);navigator.clipboard.writeText(e.dataset.p);e.textContent='✅';setTimeout(()=>e.textContent='••••••',1500)}
+
+function sEd(id){
+    const u=UD.find(x=>x.id==id);if(!u)return;
+    document.getElementById('em').classList.remove('hidden');
+    document.getElementById('en').textContent=u.username;
+    document.getElementById('ei').value=u.id;
+    document.getElementById('ep').value='';
+    document.getElementById('ed').value=Math.max(Math.ceil((new Date(u.expires_at).getTime()-Date.now())/86400000),1);
+    document.getElementById('ec').value=u.max_conn;
+    document.getElementById('edl').value=u.data_limit;
+    document.getElementById('eb').value=u.bw_limit;
 }
 
-// Toggle password visibility
-function togglePass(id) {
-    const el = document.getElementById('pass-' + id);
-    if (el.textContent === '••••••••') {
-        el.textContent = el.dataset.pass;
-    } else {
-        el.textContent = '••••••••';
-    }
+function mkConfigs(u){
+    const ep=encodeURIComponent(u.password);
+    const port=parseInt(SPT);
+    // NapsternetV JSON
+    const npvObj={sshConfigType:"SSH-Direct",sni:"",tlsVersion:"DEFAULT",httpProxy:"",authenticateProxy:false,proxyUsername:"",proxyPassword:"",payload:"",dnsTTMode:"UDP",dnsServer:"",nameserver:"",publicKey:"",udpgwPort:0,remarks:u.username,sshHost:SIP,sshPort:port,sshUsername:u.username,sshPassword:u.password,udpgwTransparentDNS:true};
+    // Rocket JSON
+    const rktObj={host:SIP,port:port,username:u.username,password:u.password,remark:u.username,udpgw:"127.0.0.1:7300"};
+    return[
+        {name:'NetMod',icon:'🔧',uri:'ssh://'+u.username+':'+u.password+'@'+SIP+':'+SPT+'#'+u.username},
+        {name:'NapsternetV',icon:'🌐',uri:'npvt-ssh://'+btoa(JSON.stringify(npvObj))},
+        {name:'Rocket SSH',icon:'🚀',uri:'rocket-ssh://'+btoa(JSON.stringify(rktObj))},
+        {name:'V2Box / MRZ',icon:'📦',uri:'ssh://'+u.username+':'+u.password+'@'+SIP+':'+SPT+'#'+u.username},
+    ];
 }
 
-// Copy password
-function copyPass(id) {
-    const el = document.getElementById('pass-' + id);
-    navigator.clipboard.writeText(el.dataset.pass).then(() => {
-        el.textContent = '✓ Copied!';
-        setTimeout(() => el.textContent = '••••••••', 1500);
-    });
-}
-
-// Copy URI
-function copyUri(elId, btn) {
-    const el = document.getElementById(elId);
-    navigator.clipboard.writeText(el.textContent).then(() => {
-        const orig = btn.textContent;
-        btn.textContent = '✅ Copied!';
-        setTimeout(() => btn.textContent = orig, 1500);
-    });
-}
-
-// Show edit modal
-function showEdit(user) {
-    document.getElementById('edit-modal').classList.remove('hidden');
-    document.getElementById('edit-title').textContent = user.username;
-    document.getElementById('edit-id').value = user.id;
-    document.getElementById('edit-reset-id').value = user.id;
-    document.getElementById('edit-pass').value = '';
-    const daysLeft = Math.ceil((new Date(user.expires_at).getTime() - Date.now()) / 86400000);
-    document.getElementById('edit-days').value = Math.max(daysLeft, 1);
-    document.getElementById('edit-maxconn').value = user.max_connections;
-    document.getElementById('edit-data').value = user.data_limit;
-    document.getElementById('edit-bw').value = user.bandwidth_limit;
-}
-
-// Show QR modal with AJAX
-function showQR(userId, username) {
-    document.getElementById('qr-modal').classList.remove('hidden');
-    document.getElementById('qr-title').textContent = username;
-    const container = document.getElementById('qr-content');
-    container.innerHTML = '<div class="col-span-2 text-center text-gray-400 py-8">Loading...</div>';
-
-    fetch('api.php?action=get_qr_configs&id=' + userId)
-        .then(r => r.json())
-        .then(data => {
-            if (!data.success) { container.innerHTML = '<p class="text-red-400 col-span-2 text-center">Error</p>'; return; }
-            container.innerHTML = '';
-            data.configs.forEach((config, i) => {
-                const card = document.createElement('div');
-                card.className = 'glass qr-card rounded-xl p-4';
-                card.innerHTML = `
-                    <div class="flex items-center gap-2 mb-3"><span class="text-xl">${config.icon}</span><h4 class="font-semibold text-white">${config.name}</h4></div>
-                    <div class="flex justify-center mb-3"><div class="bg-white p-2.5 rounded-lg"><canvas id="qr-admin-${i}" width="140" height="140"></canvas></div></div>
-                    <div class="bg-dark-900/80 rounded-lg p-2 mb-3"><p id="qr-uri-${i}" class="text-xs text-gray-400 break-all font-mono leading-relaxed max-h-14 overflow-y-auto">${escHtml(config.uri)}</p></div>
-                    <button onclick="copyUri('qr-uri-${i}', this)" class="w-full py-2 rounded-lg text-sm font-medium bg-blue-500/10 text-blue-400 border border-blue-500/20">📋 Copy</button>
-                `;
-                container.appendChild(card);
-                setTimeout(() => {
-                    try {
-                        QRCode.toCanvas(document.getElementById('qr-admin-' + i), config.uri, {width:140,margin:0,color:{dark:'#000',light:'#fff'}});
-                    } catch(e) { console.error('QR error:', e); }
-                }, 50);
+function sQR(id){
+    const u=UD.find(x=>x.id==id);if(!u)return;
+    document.getElementById('qm').classList.remove('hidden');
+    document.getElementById('qn').textContent=u.username;
+    const cfgs=mkConfigs(u);
+    const c=document.getElementById('qc');
+    c.innerHTML=cfgs.map((cfg,i)=>`
+        <div class="bg-[#0a0e17]/50 border border-blue-500/10 rounded-xl p-4">
+            <p class="font-semibold text-white text-sm mb-3">${cfg.icon} ${cfg.name}</p>
+            <div class="flex justify-center mb-3"><img id="qi-${i}" class="rounded-lg" width="140" height="140" alt="QR"></div>
+            <div class="bg-[#0a0e17] rounded-lg p-2 mb-3"><p class="text-[9px] text-gray-400 break-all font-mono max-h-12 overflow-y-auto" id="qu-${i}">${cfg.uri.replace(/</g,'&lt;')}</p></div>
+            <button onclick="cQR(${i})" id="qb-${i}" class="w-full py-2 rounded-lg text-sm bg-blue-500/10 text-blue-400 border border-blue-500/20 hover:bg-blue-500/20">📋 Copy</button>
+        </div>`).join('');
+    setTimeout(()=>{
+        cfgs.forEach((cfg,i)=>{
+            QRCode.toDataURL(cfg.uri,{width:140,margin:1,errorCorrectionLevel:'L'},function(err,url){
+                if(!err)document.getElementById('qi-'+i).src=url;
             });
-        })
-        .catch(e => { container.innerHTML = '<p class="text-red-400 col-span-2 text-center">Failed to load</p>'; console.error(e); });
+        });
+    },50);
 }
-
-function escHtml(s) {
-    const d = document.createElement('div');
-    d.textContent = s;
-    return d.innerHTML;
-}
-
-// Auto-refresh on dashboard/online pages
-<?php if (in_array($page, ['dashboard', 'online'])): ?>
-setTimeout(() => location.reload(), 30000);
-<?php endif; ?>
+function cQR(i){navigator.clipboard.writeText(document.getElementById('qu-'+i).textContent);document.getElementById('qb-'+i).textContent='✅ Copied!';setTimeout(()=>document.getElementById('qb-'+i).textContent='📋 Copy',1500)}
 </script>
-</body>
-</html>
+
+<?php elseif($page==='online'):?>
+<div class="space-y-4"><h1 class="text-xl font-bold text-white">🟢 Online <span class="bdg bg-green-500/20 text-green-400 ml-2"><?=count($onlineUsers)?></span></h1>
+<?php if(empty($onlineUsers)):?><div class="card rounded-2xl p-12 text-center text-gray-500 text-sm">Nobody online</div>
+<?php else:?><div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+<?php foreach($onlineUsers as $u): $dl=daysLeft($u['expires_at']); $dp=$u['data_limit']>0?min(($u['data_used']/$u['data_limit'])*100,100):0;?>
+<div class="card rounded-xl p-4">
+<div class="flex items-center justify-between mb-3"><div class="flex items-center gap-2"><span class="w-2.5 h-2.5 rounded-full bg-green-400 pulse"></span><span class="font-semibold text-white text-sm"><?=htmlspecialchars($u['username'])?></span></div>
+<form method="POST"><input type="hidden" name="action" value="kick_user"><input type="hidden" name="id" value="<?=$u['id']?>"><button type="submit" class="p-1 rounded hover:bg-red-500/20 text-red-400 text-xs">⚡Kick</button></form></div>
+<div class="space-y-1.5 text-xs">
+<div class="flex justify-between"><span class="text-gray-400">Conn</span><span class="text-cyan-400"><?=$u['cur_conn']?>/<?=$u['max_conn']?></span></div>
+<div class="flex justify-between"><span class="text-gray-400">Time</span><span class="<?=$dl<=3?'text-yellow-400':'text-gray-300'?>"><?=$dl?>d</span></div>
+<div class="flex justify-between"><span class="text-gray-400">Data</span><span class="text-gray-300"><?=fmtData($u['data_used'])?><?=$u['data_limit']>0?'/'.fmtData($u['data_limit']):''?></span></div>
+<?php if($u['data_limit']>0):?><div class="h-1.5 bg-blue-500/20 rounded-full"><div class="h-full rounded-full" style="width:<?=$dp?>%;background:<?=$dp>90?'#ef4444':($dp>70?'#f59e0b':'#3b82f6')?>"></div></div><?php endif;?>
+</div>
+<?php $ips=array_filter(explode(',',$u['ips']));if($ips):?><div class="mt-2 pt-2 border-t border-gray-700/30"><div class="flex gap-1"><?php foreach($ips as $ip):?><span class="text-[10px] bg-gray-700/60 px-1.5 py-0.5 rounded text-gray-300 font-mono"><?=htmlspecialchars($ip)?></span><?php endforeach;?></div></div><?php endif;?>
+</div><?php endforeach;?></div><?php endif;?></div>
+
+<?php elseif($page==='settings'):?>
+<div class="space-y-5 max-w-3xl"><h1 class="text-xl font-bold text-white">⚙️ Settings</h1>
+<form method="POST"><input type="hidden" name="action" value="save_settings">
+<div class="card rounded-2xl p-5 mb-5"><h3 class="text-base font-semibold text-white mb-3">🌐 SSH</h3>
+<div class="grid grid-cols-2 gap-3">
+<div><label class="block text-xs text-gray-400 mb-1">Port</label><input type="number" name="ssh_port" value="<?=htmlspecialchars($sshPort)?>" class="inp"></div>
+<div><label class="block text-xs text-gray-400 mb-1">Server IP</label><input type="text" name="server_ip" value="<?=htmlspecialchars(getSetting('server_ip',''))?>" placeholder="<?=$serverIP?>" class="inp"></div>
+</div></div>
+<div class="card rounded-2xl p-5 mb-5"><h3 class="text-base font-semibold text-white mb-3">🔑 Admin</h3>
+<div class="grid grid-cols-2 gap-3">
+<div><label class="block text-xs text-gray-400 mb-1">User</label><input type="text" name="admin_user" value="<?=htmlspecialchars(getSetting('admin_user','admin'))?>" class="inp"></div>
+<div><label class="block text-xs text-gray-400 mb-1">Pass</label><input type="text" name="admin_pass" value="<?=htmlspecialchars(getSetting('admin_pass','admin'))?>" class="inp"></div>
+</div></div>
+<div class="card rounded-2xl p-5 mb-5"><h3 class="text-base font-semibold text-white mb-3">🤖 Telegram</h3>
+<div><label class="block text-xs text-gray-400 mb-1">Bot Token</label><input type="text" name="tg_token" value="<?=htmlspecialchars(getSetting('tg_token',''))?>" class="inp font-mono text-sm" placeholder="123456:ABC..."></div>
+</div>
+<button type="submit" class="btn px-6 py-2.5 text-sm">💾 Save</button>
+</form>
+<div class="card rounded-2xl p-5"><h3 class="text-base font-semibold text-white mb-3">💬 Chats</h3>
+<form method="POST" class="flex gap-2 mb-3"><input type="hidden" name="action" value="add_chat"><input type="text" name="chat_id" class="inp flex-1" placeholder="Chat ID" required><button type="submit" class="btn px-4 py-2 text-sm">+</button></form>
+<div class="flex flex-wrap gap-1.5 mb-4">
+<?php foreach($tgChats as $ch):?><div class="flex items-center gap-1 bg-gray-700/60 px-2.5 py-1 rounded-full text-xs"><span class="text-gray-300"><?=htmlspecialchars($ch)?></span><form method="POST" class="inline"><input type="hidden" name="action" value="remove_chat"><input type="hidden" name="chat_id" value="<?=htmlspecialchars($ch)?>"><button type="submit" class="text-gray-500 hover:text-red-400 ml-0.5">✕</button></form></div><?php endforeach;?>
+</div>
+<form method="POST" class="inline"><input type="hidden" name="action" value="test_telegram"><button type="submit" class="btn px-4 py-2 text-sm">📤 Test</button></form>
+</div>
+<div class="card rounded-2xl p-5"><h3 class="text-base font-semibold text-white mb-3">💾 Backup</h3>
+<div class="flex gap-3">
+<form method="POST"><input type="hidden" name="action" value="backup"><button type="submit" class="btn-g px-4 py-2 text-white rounded-lg text-sm font-semibold">⬇️ SQL</button></form>
+<form method="POST"><input type="hidden" name="action" value="telegram_backup"><button type="submit" class="btn px-4 py-2 text-sm">📤 TG</button></form>
+</div></div></div>
+
+<?php endif;?>
+</main></div>
+<script>
+<?php if(in_array($page,['dashboard','online'])&&$isAdmin):?>setTimeout(()=>location.reload(),30000);<?php endif;?>
+</script>
+<?php endif;?>
+</body></html>
